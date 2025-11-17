@@ -1,4 +1,4 @@
-// Ragebot.cpp - УЛУЧШЕННАЯ ВЕРСИЯ
+// Ragebot.cpp - пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ
 
 #include "../Config.h"
 #include "../Interfaces.h"
@@ -39,7 +39,7 @@ void Ragebot::updateInput() noexcept
 
 static std::unordered_map<int, Ragebot::TargetMovement> targetMovements;
 
-// УЛУЧШЕНИЕ: более точное предсказание движения
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
 void updateTargetMovement(Entity* target) noexcept
 {
     if (!target)
@@ -54,9 +54,9 @@ void updateTargetMovement(Entity* target) noexcept
         auto& record = targetMovements[index];
         const float deltaTime = currentTime - record.simulationTime;
 
-        if (deltaTime > 0.0f && deltaTime < 1.0f) // Санитарная проверка
+        if (deltaTime > 0.0f && deltaTime < 1.0f) // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
         {
-            // Сглаженное обновление velocity
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ velocity
             const Vector newVelocity = (currentPos - target->getAbsOrigin()) / deltaTime;
             record.velocity = Helpers::lerp(0.7f, record.velocity, newVelocity); // Smooth transition
             record.simulationTime = currentTime;
@@ -68,7 +68,7 @@ void updateTargetMovement(Entity* target) noexcept
     }
 }
 
-// УЛУЧШЕНИЕ: предсказание с учетом acceleration
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ acceleration
 Vector predictTargetPosition(Entity* target, float predictionTime) noexcept
 {
     if (!target)
@@ -81,10 +81,10 @@ Vector predictTargetPosition(Entity* target, float predictionTime) noexcept
     const auto& movement = targetMovements[index];
     Vector predictedPos = target->getAbsOrigin();
 
-    // Учитываем текущую velocity
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ velocity
     predictedPos = predictedPos + movement.velocity * predictionTime;
 
-    // Компенсация gravity если в воздухе
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ gravity пїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     if (!(target->flags() & FL_ONGROUND))
     {
         static auto gravity = interfaces->cvar->findVar(skCrypt("sv_gravity"));
@@ -98,7 +98,7 @@ Vector predictTargetPosition(Entity* target, float predictionTime) noexcept
     return predictedPos;
 }
 
-// УЛУЧШЕНИЕ: более умный predictive auto-stop
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ predictive auto-stop
 void handlePredictiveAutoStop(UserCmd* cmd, Entity* target, float accuracyBoost) noexcept
 {
     if (!target || !localPlayer)
@@ -146,7 +146,7 @@ void handlePredictiveAutoStop(UserCmd* cmd, Entity* target, float accuracyBoost)
     }
 }
 
-// УЛУЧШЕНИЕ: оптимизированный early auto-stop
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ early auto-stop
 void applyEarlyAutostop(UserCmd* cmd, Entity* weapon, float accuracyBoost) noexcept
 {
     if (!localPlayer || !weapon)
@@ -160,22 +160,22 @@ void applyEarlyAutostop(UserCmd* cmd, Entity* weapon, float accuracyBoost) noexc
     const float speed = velocity.length2D();
     const float maxSpeed = (localPlayer->isScoped() ? weaponData->maxSpeedAlt : weaponData->maxSpeed) * (1.0f - accuracyBoost);
 
-    // Если скорость ниже порога или в воздухе
+    // пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     if (speed < 10.0f || !(localPlayer->flags() & FL_ONGROUND))
         return;
 
-    // Константы движения
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     constexpr float friction = 5.0f;
     constexpr float acceleration = 5.5f;
 
-    // Рассчитываем требуемое замедление
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     const float targetSpeed = maxSpeed * 0.95f;
     const float speedReduction = speed - targetSpeed;
 
     if (speedReduction <= 0.0f)
         return;
 
-    // Получаем направление движения
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     Vector moveDir = velocity.toAngle();
     moveDir.y = cmd->viewangles.y - moveDir.y;
 
@@ -184,13 +184,13 @@ void applyEarlyAutostop(UserCmd* cmd, Entity* weapon, float accuracyBoost) noexc
 
     const Vector negatedDir = forward * -450.0f;
 
-    // Применяем торможение пропорционально превышению скорости
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     const float brakeFactor = std::clamp(speedReduction / maxSpeed, 0.0f, 1.0f);
     cmd->forwardmove = negatedDir.x * brakeFactor;
     cmd->sidemove = negatedDir.y * brakeFactor;
 }
 
-// УЛУЧШЕНИЕ: более эффективное сканирование с приоритизацией
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
 void runRagebot(
     UserCmd* cmd,
     Entity* entity,
@@ -227,7 +227,7 @@ void runRagebot(
 
     static auto isSpreadEnabled = interfaces->cvar->findVar(skCrypt("weapon_accuracy_nospread"));
 
-    // УЛУЧШЕНИЕ: сортируем хитбоксы по приоритету
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     struct HitboxPriority
     {
         int index;
@@ -248,7 +248,7 @@ void runRagebot(
 
         float priority = 0.0f;
 
-        // Приоритет на основе хитбокса
+        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
         switch (i)
         {
         case Hitboxes::Head:
@@ -273,10 +273,10 @@ void runRagebot(
         prioritizedHitboxes.push_back({ static_cast<int>(i), priority });
     }
 
-    // Сортируем по приоритету
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     std::sort(prioritizedHitboxes.begin(), prioritizedHitboxes.end());
 
-    // УЛУЧШЕНИЕ: сканируем в порядке приоритета
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     for (const auto& prioHitbox : prioritizedHitboxes)
     {
         const int i = prioHitbox.index;
@@ -285,7 +285,7 @@ void runRagebot(
         if (!hitboxData)
             continue;
 
-        // Генерируем мультипоинты
+        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
         auto multipoints = AimbotFunction::multiPoint(
             entity,
             matrix,
@@ -296,7 +296,7 @@ void runRagebot(
             multiPointBody
         );
 
-        // Проверяем каждую точку
+        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ
         for (auto& bonePosition : multipoints)
         {
             const auto angle = AimbotFunction::calculateRelativeAngle(
@@ -309,7 +309,7 @@ void runRagebot(
             if (fov > cfg.fov)
                 continue;
 
-            // Проверяем damage
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ damage
             float damage = AimbotFunction::getScanDamage(
                 entity,
                 bonePosition,
@@ -330,7 +330,7 @@ void runRagebot(
                 cmd->buttons |= UserCmd::IN_ZOOM;
             }
 
-            // Auto-Stop с улучшенной логикой
+            // Auto-Stop пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
             if (cfg1[weaponIndex].autoStop &&
                 (localPlayer->flags() & FL_ONGROUND) &&
                 !(cmd->buttons & UserCmd::IN_JUMP) &&
@@ -389,14 +389,14 @@ void runRagebot(
                 EnginePrediction::update();
             }
 
-            // УЛУЧШЕНИЕ: выбираем лучшую точку с учетом приоритета хитбокса
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
             const float damageScore = damage * 2.0f;
             const float priorityScore = prioHitbox.priority;
             const float totalScore = damageScore + priorityScore;
 
             const float currentDiff = std::fabsf(static_cast<float>(target.health) - damage);
 
-            // Если damage почти одинаковый - выбираем по приоритету хитбокса
+            // пїЅпїЅпїЅпїЅ damage пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ - пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
             if (std::fabsf(currentDiff - damageDiff) < 5.0f)
             {
                 if (prioHitbox.priority > 0.0f) // Prefer higher priority hitbox
@@ -414,12 +414,12 @@ void runRagebot(
             }
         }
 
-        // ОПТИМИЗАЦИЯ: если нашли идеальную точку на голове - прекращаем поиск
+        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ - пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ
         if (i == Hitboxes::Head && bestTarget.notNull() && damageDiff < 10.0f)
             break;
     }
 
-    // Hit chance проверка
+    // Hit chance пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     if (bestTarget.notNull())
     {
         bool hitChanceOverrideActive = config->hitchanceOverride.isActive() && cfg1[weaponIndex].hcov;
@@ -565,7 +565,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             false : (cfg1[weaponIndex].hitboxes & (1 << 8)) == (1 << 8);
     }
 
-    // Собираем enemies
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ enemies
     std::vector<Ragebot::Enemies> enemies;
     const auto& localPlayerOrigin = localPlayer->getAbsOrigin();
 
@@ -597,7 +597,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
     if (enemies.empty())
         return;
 
-    // Сортировка enemies
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ enemies
     switch (cfg.priority)
     {
     case 0:
@@ -616,7 +616,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
     auto multiPointHead = cfg1[weaponIndex].multiPointHead;
     auto multiPointBody = cfg1[weaponIndex].multiPointBody;
 
-    // Обрабатываем каждый enemy
+    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ enemy
     for (const auto& target : enemies)
     {
         auto entity = interfaces->entityList->getEntity(target.id);
@@ -634,7 +634,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
         Vector backupOrigin = entity->getAbsOrigin();
         Vector backupAbsAngle = entity->getAbsAngle();
 
-        // Проверяем оба цикла (current + backtrack)
+        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ (current + backtrack)
         for (size_t cycle = 0; cycle < 2; cycle++)
         {
             auto update = player_records[cycle].empty() ||
@@ -668,7 +668,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
 
                 if (cycle == 0)
                 {
-                    // Ищем лучший tick
+                    // пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ tick
                     for (size_t i = 0; i < records->size(); i++)
                     {
                         if (Backtrack::valid(records->at(i).simulationTime))
@@ -680,7 +680,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
                 }
                 else
                 {
-                    // Обратный поиск
+                    // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ
                     for (int i = static_cast<int>(records->size() - 1U); i >= 0; i--)
                     {
                         if (Backtrack::valid(records->at(i).simulationTime))
@@ -694,7 +694,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
                 if (bestTick <= -1)
                     continue;
 
-                // Устанавливаем backtrack матрицу
+                // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ backtrack пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
                 memcpy(entity->getBoneCache().memory, records->at(bestTick).matrix,
                     std::clamp(entity->getBoneCache().size, 0, MAXSTUDIOBONES) * sizeof(matrix3x4));
                 memory->setAbsOrigin(entity, records->at(bestTick).origin);
@@ -707,7 +707,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             }
             else
             {
-                // Без backtrack - скипаем второй цикл
+                // пїЅпїЅпїЅ backtrack - пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ
                 if (cycle == 1)
                     continue;
 
@@ -723,7 +723,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             // Resolver
             Resolver::resolve_shot(const_cast<Animations::Players&>(player), entity);
 
-            // Запускаем сканирование
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
             runRagebot(
                 cmd,
                 entity,
@@ -742,7 +742,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
                 bestTarget
             );
 
-            // Restore матрицу
+            // Restore пїЅпїЅпїЅпїЅпїЅпїЅпїЅ
             resetMatrix(entity, backupBoneCache, backupOrigin, backupAbsAngle, backupMins, backupMaxs);
 
             if (bestTarget.notNull())
@@ -757,7 +757,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             break;
     }
 
-    // Если нашли цель - целимся и стреляем
+    // пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ - пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
     if (bestTarget.notNull())
     {
         static Vector lastAngles{ cmd->viewangles };
