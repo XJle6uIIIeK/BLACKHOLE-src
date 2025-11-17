@@ -53,9 +53,6 @@ namespace Tickbase
 	void updateInput() noexcept;
 	void reset() noexcept;
 
-	Vector eye_pos = ZERO;
-	Vector velocity = ZERO;
-
 	int doubletapCharge = 0,
 		ticksToShift = 0,
 		commandNumber = 0,

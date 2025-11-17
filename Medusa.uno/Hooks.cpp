@@ -468,145 +468,155 @@ static bool __stdcall createMove(float inputSampleTime, UserCmd* cmd, bool& send
     static auto previousViewAngles{ cmd->viewangles };
     const auto viewAngles{ cmd->viewangles };
     auto currentViewAngles{ cmd->viewangles };
+
+    // Backup команды
     const auto currentCmd{ *cmd };
-    auto angOldViewPoint{ cmd->viewangles };
-    const auto currentPredictedTick{ interfaces->prediction->split->commandsPredicted - 1 };
+
+    // КРИТИЧНО: сохраняем predicted tick ДО любых изменений
+    const auto currentPredictedTick = interfaces->prediction->split->commandsPredicted - 1;
+
+    // ===== TICKBASE SHIFTING MODE =====
     if (Tickbase::isShifting())
     {
         sendPacket = Tickbase::isFinalTick();
+
+        // Отключаем атаку во время shifting
         cmd->buttons &= ~(UserCmd::IN_ATTACK | UserCmd::IN_ATTACK2);
 
-        //Set all movement to its max value
+        // Максимизируем движение для DT
         if (config->tickbase.doubletap.isActive())
         {
-
             Vector vMove(cmd->forwardmove, cmd->sidemove, cmd->upmove);
-            float flSpeed = sqrt(vMove.x * vMove.x + vMove.y * vMove.y), flYaw;
+            float flSpeed = std::sqrt(vMove.x * vMove.x + vMove.y * vMove.y);
             Vector vMove2;
             Helpers::VectorAngles(vMove, vMove2);
             vMove2.normalize();
 
-            flYaw = DEG2RAD(cmd->viewangles.y - previousViewAngles.y + vMove2.y);
-            cmd->forwardmove = cos(flYaw) * flSpeed;
-            cmd->sidemove = sin(flYaw) * flSpeed;
+            float flYaw = DEG2RAD(cmd->viewangles.y - previousViewAngles.y + vMove2.y);
+            cmd->forwardmove = std::cos(flYaw) * flSpeed;
+            cmd->sidemove = std::sin(flYaw) * flSpeed;
         }
         else
         {
-            if (cmd->sidemove > 5.0f)
-                cmd->sidemove = 450.0f;
-            else if (cmd->sidemove < -5.0f)
-                cmd->sidemove = -450.0f;
-
-            if (cmd->forwardmove > 5.0f)
-                cmd->forwardmove = 450.0f;
-            else if (cmd->forwardmove < -5.0f)
-                cmd->forwardmove = -450.0f;
+            // Hideshots - простая максимизация
+            if (std::abs(cmd->sidemove) > 5.0f)
+                cmd->sidemove = std::copysign(450.0f, cmd->sidemove);
+            if (std::abs(cmd->forwardmove) > 5.0f)
+                cmd->forwardmove = std::copysign(450.0f, cmd->forwardmove);
         }
 
-        //Run all movement related stuff
+        // Базовые хаки для shifting
         Misc::bunnyHop(cmd);
         Misc::removeCrouchCooldown(cmd);
         Misc::slowwalk(cmd);
+        Misc::autoPeek(cmd, currentViewAngles);
+        Misc::autoPixelSurf(cmd);
+        Misc::NullStrafe(cmd);
+        Misc::autoStrafe(cmd, currentViewAngles);
 
+        // Prediction для shifting
         EnginePrediction::update();
         EnginePrediction::run(cmd);
 
-        Misc::autoPeek(cmd, currentViewAngles);
-        Misc::autoPixelSurf(cmd);
-        Misc::miniJump(cmd);
-        Misc::edgejump(cmd);
-        Misc::NullStrafe(cmd);
-        Misc::autoStrafe(cmd, currentViewAngles);
-        Misc::jumpBug(cmd);
-        Resolver::CmdGrabber(cmd);
-        Visuals::getCmd(cmd);
-        Misc::getCmd(cmd);
-        Tickbase::getCmd(cmd);
-        Sex::GetCmd(cmd);
+        // AntiAim для shifting
         if (AntiAim::canRun(cmd))
             AntiAim::run(cmd, previousViewAngles, currentViewAngles, sendPacket);
 
-        //Clamp angles and fix movement
-        auto viewAnglesDelta{ cmd->viewangles - previousViewAngles };
+        // Clamp и fix
+        auto viewAnglesDelta = cmd->viewangles - previousViewAngles;
         viewAnglesDelta.normalize();
         viewAnglesDelta.x = std::clamp(viewAnglesDelta.x, -255.f, 255.f);
         viewAnglesDelta.y = std::clamp(viewAnglesDelta.y, -255.f, 255.f);
-
         cmd->viewangles = previousViewAngles + viewAnglesDelta;
-
         cmd->viewangles.normalize();
 
-        if ((currentViewAngles != cmd->viewangles
-            || cmd->forwardmove != currentCmd.forwardmove
-            || cmd->sidemove != currentCmd.sidemove) && (cmd->sidemove != 0 || cmd->forwardmove != 0))
+        if (currentViewAngles != cmd->viewangles ||
+            cmd->forwardmove != currentCmd.forwardmove ||
+            cmd->sidemove != currentCmd.sidemove)
         {
             Misc::fixMovement(cmd, currentViewAngles.y);
         }
+
         cmd->viewangles.x = std::clamp(cmd->viewangles.x, -89.0f, 89.0f);
         cmd->viewangles.y = std::clamp(cmd->viewangles.y, -180.0f, 180.0f);
-        cmd->viewangles.z = 0;
+        cmd->viewangles.z = 0.f;
         cmd->forwardmove = std::clamp(cmd->forwardmove, -450.0f, 450.0f);
         cmd->sidemove = std::clamp(cmd->sidemove, -450.0f, 450.0f);
         cmd->upmove = std::clamp(cmd->upmove, -320.0f, 320.0f);
 
         if (localPlayer && localPlayer->isAlive())
             memory->restoreEntityToPredictedFrame(0, currentPredictedTick);
+
         Misc::gatherDataOnTick(cmd);
         Misc::jumpStats(cmd);
         Animations::update(cmd, sendPacket);
         Animations::fake();
         AntiAim::setDidShoot(AntiAim::getIsShooting());
+
         return false;
     }
+
+    // ===== NORMAL MODE (не shifting) =====
+
     Resolver::processMissedShots();
 
+    // 1. TICKBASE START
     Tickbase::start(cmd);
 
     memory->globalVars->serverTime(cmd);
+
+    // 2. БАЗОВЫЕ ХАКИ
     Misc::antiAfkKick(cmd);
     Misc::fastStop(cmd);
-    Visuals::fullBright();
-    Visuals::shadowChanger();
-    Misc::runReportbot();
     Misc::bunnyHop(cmd);
     Misc::removeCrouchCooldown(cmd);
     Misc::autoPistol(cmd);
     Misc::autoReload(cmd);
+    Misc::slowwalk(cmd);
+
     Clan::update();
-    //Misc::updateClanTag();
     Misc::stealNames();
     Misc::revealRanks(cmd);
     Misc::fixTabletSignal();
-    Misc::slowwalk(cmd);
-    //Misc::PixelSurfAlign(cmd);
+
+    // 3. VISUALS
+    Visuals::fullBright();
+    Visuals::shadowChanger();
+
+    // 4. BACKTRACK
     Backtrack::updateIncomingSequences();
 
+    // 5. ENGINE PREDICTION
     EnginePrediction::update();
     EnginePrediction::run(cmd);
     GrenadePrediction::run(cmd);
 
+    // 6. AIMBOT SYSTEMS
     Legitbot::run(cmd);
     Backtrack::run(cmd);
     Triggerbot::run(cmd);
     Ragebot::run(cmd);
     Knifebot::run(cmd);
+
+    // 7. TICKBASE END (CRITICAL - перед AntiAim!)
     Tickbase::end(cmd, sendPacket);
 
+    // 8. MOVEMENT HACKS
     Misc::autoPeek(cmd, currentViewAngles);
     Misc::autoPixelSurf(cmd);
     Misc::miniJump(cmd);
     Misc::edgejump(cmd);
     Misc::blockBot(cmd);
     Misc::doorSpam(cmd);
-    Resolver::CmdGrabber(cmd);
-    Visuals::getCmd(cmd);
-    Misc::getCmd(cmd);
-    Sex::GetCmd(cmd);
+
+    // 9. ANTI-AIM (ПОСЛЕ Tickbase::end!)
     if (AntiAim::canRun(cmd))
     {
         Fakelag::run(sendPacket);
         AntiAim::run(cmd, previousViewAngles, currentViewAngles, sendPacket);
     }
+
+    // 10. ОСТАЛЬНЫЕ MOVEMENT ХАКИ
     Misc::fakeWalk(cmd, sendPacket);
     Misc::fakeDuck(cmd, sendPacket);
     Misc::NullStrafe(cmd);
@@ -617,41 +627,47 @@ static bool __stdcall createMove(float inputSampleTime, UserCmd* cmd, bool& send
     Misc::runFreeCam(cmd, viewAngles);
     Misc::moonwalk(cmd, sendPacket);
 
-    auto viewAnglesDelta{ cmd->viewangles - previousViewAngles };
+    // 11. ANGLE CLAMPING
+    auto viewAnglesDelta = cmd->viewangles - previousViewAngles;
     viewAnglesDelta.normalize();
     viewAnglesDelta.x = std::clamp(viewAnglesDelta.x, -255.f, 255.f);
     viewAnglesDelta.y = std::clamp(viewAnglesDelta.y, -255.f, 255.f);
-
     cmd->viewangles = previousViewAngles + viewAnglesDelta;
-
     cmd->viewangles.normalize();
 
-    if ((currentViewAngles != cmd->viewangles
-        || cmd->forwardmove != currentCmd.forwardmove
-        || cmd->sidemove != currentCmd.sidemove) && (cmd->sidemove != 0 || cmd->forwardmove != 0))
+    // 12. MOVEMENT FIX
+    if (currentViewAngles != cmd->viewangles ||
+        cmd->forwardmove != currentCmd.forwardmove ||
+        cmd->sidemove != currentCmd.sidemove)
     {
         Misc::fixMovement(cmd, currentViewAngles.y);
     }
 
-    cmd->viewangles.x = std::clamp(cmd->viewangles.x, -180.0f, 180.0f);
+    // 13. FINAL CLAMPS
+    cmd->viewangles.x = std::clamp(cmd->viewangles.x, -89.0f, 89.0f);
     cmd->viewangles.y = std::clamp(cmd->viewangles.y, -180.0f, 180.0f);
-    cmd->viewangles.z = std::clamp(cmd->viewangles.z, -180.0f, 180.0f);
+    cmd->viewangles.z = std::clamp(cmd->viewangles.z, -50.0f, 50.0f);
     cmd->forwardmove = std::clamp(cmd->forwardmove, -450.0f, 450.0f);
     cmd->sidemove = std::clamp(cmd->sidemove, -450.0f, 450.0f);
     cmd->upmove = std::clamp(cmd->upmove, -320.0f, 320.0f);
+
+    // 14. MISC
     Misc::prepareRevolver(cmd);
     previousViewAngles = cmd->viewangles;
-
     Visuals::updateShots(cmd);
 
+    // 15. RESTORE PREDICTION
     if (localPlayer && localPlayer->isAlive())
         memory->restoreEntityToPredictedFrame(0, currentPredictedTick);
+
+    // 16. ANIMATIONS
     Misc::gatherDataOnTick(cmd);
     Misc::jumpStats(cmd);
     Animations::update(cmd, sendPacket);
     Animations::fake();
     Animations::getFakelagMatrix();
     AntiAim::setDidShoot(AntiAim::getIsShooting());
+
     return false;
 }
 
@@ -1748,69 +1764,77 @@ void handleOtherShift(const std::uintptr_t ecx, const std::uintptr_t edx, const 
 }
 
 
-static bool __fastcall writeUsercmdDeltaToBuffer(const std::uintptr_t ecx, const std::uintptr_t edx, const int slot, bufferWrite* const buffer, int from, int to, const bool is_new_cmd) noexcept
+static bool __fastcall writeUsercmdDeltaToBuffer(
+    const std::uintptr_t ecx,
+    const std::uintptr_t edx,
+    const int slot,
+    bufferWrite* const buffer,
+    int from,
+    int to,
+    const bool is_new_cmd) noexcept
 {
-    //static auto original = hooks->client.getOriginal<bool, 24, int, bufferWrite*, int, int, bool>(slot, buffer, from, to, newCmd);
-
+    // Если нет shift или teleport выключен - используем оригинал
     if (Tickbase::getTickshift() <= 0 || config->tickbase.teleport)
-        return hooks->client.callOriginal<bool, 24, int, bufferWrite*, int, int, bool>(slot, buffer, from, to, is_new_cmd);
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, is_new_cmd);
 
-    const int extraCommands = Tickbase::getTickshift();
+    const int shiftAmount = Tickbase::getTickshift();
     Tickbase::resetTickshift();
 
     if (!localPlayer)
-        return hooks->client.callOriginal<bool, 24, int, bufferWrite*, int, int, bool>(slot, buffer, from, to, is_new_cmd);
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, is_new_cmd);
 
-    const auto move_msg = reinterpret_cast<clMsgMove*>(*reinterpret_cast<std::uintptr_t*>(reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress()) - sizeof(std::uintptr_t)) - 0x58u);
+    // Получаем move message
+    const auto move_msg = reinterpret_cast<clMsgMove*>(
+        *reinterpret_cast<std::uintptr_t*>(
+            reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress()) - sizeof(std::uintptr_t)
+            ) - 0x58u
+        );
 
-    if (extraCommands || memory->clientState->lastOutgoingCommand == Tickbase::ticksAllowedForProcessing)
+    if (!move_msg)
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, is_new_cmd);
+
+    // КРИТИЧНО: обновляем ticksAllowedForProcessing
+    const int maxShift = (std::min)(move_msg->newCommands + Tickbase::ticksAllowedForProcessing, 16);
+    int newAllowed = maxShift - move_msg->newCommands - shiftAmount;
+    Tickbase::ticksAllowedForProcessing = (std::max)(0, newAllowed);
+
+    // Обновляем команды
+    const int oldNewCmds = move_msg->newCommands;
+    move_msg->newCommands = std::clamp(move_msg->newCommands + shiftAmount, 1, 62);
+    move_msg->backupCommands = 0;
+
+    const int nextCmdNumber = memory->clientState->lastOutgoingCommand +
+        memory->clientState->chokedCommands + 1;
+
+    // Пишем original commands
+    for (to = nextCmdNumber - oldNewCmds + 1; to <= nextCmdNumber; ++to)
     {
-        if (from == -1)
-        {
-            if (memory->clientState->lastOutgoingCommand == Tickbase::ticksAllowedForProcessing)
-            {
-                move_msg->newCommands = 1;
-                move_msg->backupCommands = 0;
-
-                const auto next_cmd_number = memory->clientState->chokedCommands + memory->clientState->lastOutgoingCommand + 1;
-
-                for (to = next_cmd_number - move_msg->newCommands + 1; to <= next_cmd_number; ++to)
-                {
-                    if (!hooks->client.callOriginal<bool, 24, int, bufferWrite*, int, int, bool>(slot, buffer, from, to, is_new_cmd))
-                        return false;
-
-                    from = to;
-                }
-            }
-
-            if (config->tickbase.defensive_dt)
-                handleBreakLC(ecx, edx, slot, buffer, from, to, move_msg);
-            else
-                handleOtherShift(ecx, edx, slot, buffer, from, to, move_msg);
-        }
-
-        return true;
+        if (!hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, true))
+            return false;
+        from = to;
     }
-    else
+
+    // Получаем последнюю команду
+    const auto userCmd = memory->input->getUserCmd(slot, from);
+    if (!userCmd)
+        return false;
+
+    // Клонируем команду N раз
+    auto fromCmd = *userCmd;
+    auto toCmd = *userCmd;
+
+    for (int i = 0; i < shiftAmount; ++i)
     {
-        if (from == -1)
-        {
-            auto clamped = move_msg->newCommands + extraCommands;
-            if (clamped > 16)
-                clamped = 16;
+        ++toCmd.commandNumber;
+        toCmd.tickCount += 200; // Magic number для bypass
 
-            auto new_cmds = 0;
-            auto v70 = clamped - move_msg->newCommands;
-
-            if (v70 >= 0)
-                new_cmds = v70;
-
-            extraCommands == new_cmds;
-        }
+        writeUsercmd(buffer, &toCmd, &fromCmd);
+        fromCmd = toCmd;
     }
 
     return true;
 }
+
 
 static void __cdecl clMoveHook(float frameTime, bool isFinalTick) noexcept
 {

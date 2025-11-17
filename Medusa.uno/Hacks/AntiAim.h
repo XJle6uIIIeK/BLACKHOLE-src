@@ -19,7 +19,7 @@ namespace AntiAim
         on_use = 6
     };
     inline moving_flag latest_moving_flag{};
-    void JitterMove(UserCmd* cmd);
+    void JitterMove(UserCmd* cmd) noexcept;
     void rage(UserCmd* cmd, const Vector& previousViewAngles, const Vector& currentViewAngles, bool& sendPacket) noexcept;
     void run(UserCmd* cmd, const Vector& previousViewAngles, const Vector& currentViewAngles, bool& sendPacket) noexcept;
     void updateInput() noexcept;
