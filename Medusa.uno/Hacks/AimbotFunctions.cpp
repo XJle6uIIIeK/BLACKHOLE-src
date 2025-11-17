@@ -580,8 +580,6 @@ bool AimbotFunction::hitboxIntersection(const matrix3x4 matrix[MAXSTUDIOBONES], 
     return false;
 }
 
-// AimbotFunctions.cpp - ИСПРАВЛЕННАЯ ВЕРСИЯ multiPoint
-
 std::vector<Vector> AimbotFunction::multiPoint(Entity* entity, const matrix3x4 matrix[MAXSTUDIOBONES], StudioBbox* hitbox, Vector localEyePos, int _hitbox, int _multiPointHead, int _multiPointBody)
 {
     auto VectorTransformWrapper = [](const Vector& in1, const matrix3x4 in2, Vector& out)
@@ -781,6 +779,47 @@ std::vector<Vector> AimbotFunction::multiPoint(Entity* entity, const matrix3x4 m
     return vecArray;
 }
 
+std::vector<Vector> multiPointDynamic(
+    Entity* entity,
+    matrix3x4* matrix,
+    StudioBbox* hitbox,
+    Vector localEyePos,
+    int hitboxIndex,
+    int headScale,
+    int bodyScale
+) noexcept {
+
+    // Вычисляем расстояние до цели
+    const float distance = localEyePos.distTo(
+        matrix[hitbox->bone].origin()
+    );
+
+    // Динамическая корректировка scale на основе расстояния
+    float distanceMultiplier = 1.0f;
+
+    if (distance < 500.0f) {
+        // Близко - увеличиваем количество точек
+        distanceMultiplier = 1.3f;
+    }
+    else if (distance > 1500.0f) {
+        // Далеко - уменьшаем для производительности
+        distanceMultiplier = 0.7f;
+    }
+
+    int adjustedHeadScale = static_cast<int>(headScale * distanceMultiplier);
+    int adjustedBodyScale = static_cast<int>(bodyScale * distanceMultiplier);
+
+    // Вызываем оригинальную функцию с adjusted values
+    return AimbotFunction::multiPoint(
+        entity,
+        matrix,
+        hitbox,
+        localEyePos,
+        hitboxIndex,
+        adjustedHeadScale,
+        adjustedBodyScale
+    );
+}
 
 // AimbotFunctions.cpp - УЛУЧШЕННАЯ ВЕРСИЯ hitChance
 

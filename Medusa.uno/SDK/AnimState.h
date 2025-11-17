@@ -10,7 +10,8 @@
 #include "Pad.h"
 #include "Vector.h"
 
-#define	FL_ONGROUND				(1<<0)
+#define FL_DUCKING				(1 << 2)
+#define	FL_ONGROUND				(1 << 0)
 #define CS_PLAYER_SPEED_RUN 260.f
 #define CS_PLAYER_SPEED_WALK_MODIFIER 0.52f
 #define CS_PLAYER_SPEED_DUCK_MODIFIER 0.34f

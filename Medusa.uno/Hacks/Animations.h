@@ -7,7 +7,6 @@
 
 #include <array>
 #include <deque>
-#include "Resolver.h"
 
 struct UserCmd;
 enum class FrameStage;

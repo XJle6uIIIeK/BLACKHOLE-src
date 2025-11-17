@@ -665,8 +665,8 @@ void renderRageBotWindow(ImDrawList* drawList) noexcept
     ImGui::Checkbox(skCrypt("Auto shot"), &config->ragebot.autoShot);
     ImGui::Checkbox(skCrypt("Auto scope"), &config->ragebot.autoScope);
     ImGui::Checkbox(skCrypt("Auto stop"), &config->rageBot[RcurrentCategory].autoStop);
-    static bool multi[4] = { false, false, false, false };
     const char* multicombo_items[] = { "Force accuracy", "Between shots", "Full stop", "Duck", "Early","Predictive"};
+    static bool multi[ARRAYSIZE(multicombo_items)] = { false, false, false, false, false };
     static std::string previewvalue1 = "";
     bool once1 = false;
     for (size_t i = 0; i < ARRAYSIZE(multi); i++)

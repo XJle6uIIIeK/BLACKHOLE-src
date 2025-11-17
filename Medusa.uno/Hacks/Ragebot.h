@@ -20,7 +20,7 @@ struct Hitboxess
     bool leftThigh{ false };
 };
 
-class adjust_data
+class optimized_adjust_data
 {
 public:
     int i;
@@ -34,7 +34,7 @@ public:
 
     bool shot;
 
-    adjust_data() //-V730
+    optimized_adjust_data() //-V730
     {
         reset();
     }

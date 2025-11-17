@@ -1,4 +1,4 @@
-// Ragebot.cpp - ���������� ������
+
 
 #include "../Config.h"
 #include "../Interfaces.h"
@@ -39,7 +39,7 @@ void Ragebot::updateInput() noexcept
 
 static std::unordered_map<int, Ragebot::TargetMovement> targetMovements;
 
-// ���������: ����� ������ ������������ ��������
+
 void updateTargetMovement(Entity* target) noexcept
 {
     if (!target)
@@ -54,9 +54,9 @@ void updateTargetMovement(Entity* target) noexcept
         auto& record = targetMovements[index];
         const float deltaTime = currentTime - record.simulationTime;
 
-        if (deltaTime > 0.0f && deltaTime < 1.0f) // ���������� ��������
+        if (deltaTime > 0.0f && deltaTime < 1.0f)
         {
-            // ���������� ���������� velocity
+         
             const Vector newVelocity = (currentPos - target->getAbsOrigin()) / deltaTime;
             record.velocity = Helpers::lerp(0.7f, record.velocity, newVelocity); // Smooth transition
             record.simulationTime = currentTime;
@@ -68,7 +68,7 @@ void updateTargetMovement(Entity* target) noexcept
     }
 }
 
-// ���������: ������������ � ������ acceleration
+
 Vector predictTargetPosition(Entity* target, float predictionTime) noexcept
 {
     if (!target)
@@ -81,10 +81,9 @@ Vector predictTargetPosition(Entity* target, float predictionTime) noexcept
     const auto& movement = targetMovements[index];
     Vector predictedPos = target->getAbsOrigin();
 
-    // ��������� ������� velocity
+
     predictedPos = predictedPos + movement.velocity * predictionTime;
 
-    // ����������� gravity ���� � �������
     if (!(target->flags() & FL_ONGROUND))
     {
         static auto gravity = interfaces->cvar->findVar(skCrypt("sv_gravity"));
@@ -98,7 +97,7 @@ Vector predictTargetPosition(Entity* target, float predictionTime) noexcept
     return predictedPos;
 }
 
-// ���������: ����� ����� predictive auto-stop
+
 void handlePredictiveAutoStop(UserCmd* cmd, Entity* target, float accuracyBoost) noexcept
 {
     if (!target || !localPlayer)
@@ -146,7 +145,7 @@ void handlePredictiveAutoStop(UserCmd* cmd, Entity* target, float accuracyBoost)
     }
 }
 
-// ���������: ���������������� early auto-stop
+
 void applyEarlyAutostop(UserCmd* cmd, Entity* weapon, float accuracyBoost) noexcept
 {
     if (!localPlayer || !weapon)
@@ -160,22 +159,22 @@ void applyEarlyAutostop(UserCmd* cmd, Entity* weapon, float accuracyBoost) noexc
     const float speed = velocity.length2D();
     const float maxSpeed = (localPlayer->isScoped() ? weaponData->maxSpeedAlt : weaponData->maxSpeed) * (1.0f - accuracyBoost);
 
-    // ���� �������� ���� ������ ��� � �������
+
     if (speed < 10.0f || !(localPlayer->flags() & FL_ONGROUND))
         return;
 
-    // ��������� ��������
+
     constexpr float friction = 5.0f;
     constexpr float acceleration = 5.5f;
 
-    // ������������ ��������� ����������
+
     const float targetSpeed = maxSpeed * 0.95f;
     const float speedReduction = speed - targetSpeed;
 
     if (speedReduction <= 0.0f)
         return;
 
-    // �������� ����������� ��������
+
     Vector moveDir = velocity.toAngle();
     moveDir.y = cmd->viewangles.y - moveDir.y;
 
@@ -184,13 +183,97 @@ void applyEarlyAutostop(UserCmd* cmd, Entity* weapon, float accuracyBoost) noexc
 
     const Vector negatedDir = forward * -450.0f;
 
-    // ��������� ���������� ��������������� ���������� ��������
+
     const float brakeFactor = std::clamp(speedReduction / maxSpeed, 0.0f, 1.0f);
     cmd->forwardmove = negatedDir.x * brakeFactor;
     cmd->sidemove = negatedDir.y * brakeFactor;
 }
 
-// ���������: ����� ����������� ������������ � ��������������
+
+float calculateDynamicHitchance(
+    Entity* localPlayer,
+    Entity* target,
+    Entity* weapon,
+    const Vector& angle,
+    int baseHitchance
+) noexcept {
+
+    float hitchance = static_cast<float>(baseHitchance);
+
+    // === БОНУСЫ К ТОЧНОСТИ ===
+
+    // 1. Crouching bonus (+10%)
+    if (localPlayer->flags() & FL_DUCKING) {
+        hitchance *= 1.10f;
+    }
+
+    // 2. Scoped bonus (+15%)
+    if (weapon->isSniperRifle() && localPlayer->isScoped()) {
+        hitchance *= 1.15f;
+    }
+
+    // 3. Standing still bonus (+20%)
+    const float velocity = localPlayer->velocity().length2D();
+    if (velocity < 5.0f) {
+        hitchance *= 1.20f;
+    }
+    // Partial bonus for slow movement
+    else if (velocity < 34.0f) { // walking speed
+        hitchance *= 1.10f;
+    }
+
+    // 4. First shot accuracy bonus (+25% for first 2 shots)
+    const int shotsFired = localPlayer->shotsFired();
+    if (shotsFired == 0) {
+        hitchance *= 1.25f;
+    }
+    else if (shotsFired == 1) {
+        hitchance *= 1.15f;
+    }
+
+    // 5. Close range bonus (< 15m = +10%)
+    const float distance = localPlayer->getAbsOrigin().distTo(target->getAbsOrigin());
+    if (distance < 500.0f) { // ~15 meters
+        hitchance *= 1.10f;
+    }
+
+    // === ПЕНАЛЬТИ К ТОЧНОСТИ ===
+
+    // 1. Recoil penalty (после 3 выстрелов)
+    if (shotsFired > 3) {
+        const float recoilPenalty = 0.9f - ((std::min)(shotsFired - 3, 7) * 0.01f);
+        hitchance *= recoilPenalty; // -10% до -17%
+    }
+
+    // 2. Moving target penalty
+    const float targetVelocity = target->velocity().length2D();
+    if (targetVelocity > 100.0f) {
+        hitchance *= 0.90f;
+    }
+    if (targetVelocity > 200.0f) {
+        hitchance *= 0.85f; // итого -15% при быстром движении
+    }
+
+    // 3. Air target penalty
+    if (!(target->flags() & FL_ONGROUND)) {
+        hitchance *= 0.92f;
+    }
+
+    // 4. Long range penalty (> 30m = -15%)
+    if (distance > 1000.0f) { // ~30 meters
+        hitchance *= 0.85f;
+    }
+
+    // 5. Wide angle penalty (поворот > 30° = -10%)
+    const float angleDiff = angle.length2D();
+    if (angleDiff > 30.0f) {
+        hitchance *= 0.90f;
+    }
+
+    // Clamp результат
+    return std::clamp(hitchance, 0.0f, 100.0f);
+}
+
 void runRagebot(
     UserCmd* cmd,
     Entity* entity,
@@ -227,7 +310,7 @@ void runRagebot(
 
     static auto isSpreadEnabled = interfaces->cvar->findVar(skCrypt("weapon_accuracy_nospread"));
 
-    // ���������: ��������� �������� �� ����������
+
     struct HitboxPriority
     {
         int index;
@@ -248,7 +331,7 @@ void runRagebot(
 
         float priority = 0.0f;
 
-        // ��������� �� ������ ��������
+
         switch (i)
         {
         case Hitboxes::Head:
@@ -273,10 +356,10 @@ void runRagebot(
         prioritizedHitboxes.push_back({ static_cast<int>(i), priority });
     }
 
-    // ��������� �� ����������
+
     std::sort(prioritizedHitboxes.begin(), prioritizedHitboxes.end());
 
-    // ���������: ��������� � ������� ����������
+
     for (const auto& prioHitbox : prioritizedHitboxes)
     {
         const int i = prioHitbox.index;
@@ -285,7 +368,7 @@ void runRagebot(
         if (!hitboxData)
             continue;
 
-        // ���������� ������������
+
         auto multipoints = AimbotFunction::multiPoint(
             entity,
             matrix,
@@ -296,7 +379,7 @@ void runRagebot(
             multiPointBody
         );
 
-        // ��������� ������ �����
+
         for (auto& bonePosition : multipoints)
         {
             const auto angle = AimbotFunction::calculateRelativeAngle(
@@ -309,7 +392,6 @@ void runRagebot(
             if (fov > cfg.fov)
                 continue;
 
-            // ��������� damage
             float damage = AimbotFunction::getScanDamage(
                 entity,
                 bonePosition,
@@ -330,7 +412,7 @@ void runRagebot(
                 cmd->buttons |= UserCmd::IN_ZOOM;
             }
 
-            // Auto-Stop � ���������� �������
+
             if (cfg1[weaponIndex].autoStop &&
                 (localPlayer->flags() & FL_ONGROUND) &&
                 !(cmd->buttons & UserCmd::IN_JUMP) &&
@@ -389,14 +471,14 @@ void runRagebot(
                 EnginePrediction::update();
             }
 
-            // ���������: �������� ������ ����� � ������ ���������� ��������
+
             const float damageScore = damage * 2.0f;
             const float priorityScore = prioHitbox.priority;
             const float totalScore = damageScore + priorityScore;
 
             const float currentDiff = std::fabsf(static_cast<float>(target.health) - damage);
 
-            // ���� damage ����� ���������� - �������� �� ���������� ��������
+
             if (std::fabsf(currentDiff - damageDiff) < 5.0f)
             {
                 if (prioHitbox.priority > 0.0f) // Prefer higher priority hitbox
@@ -414,18 +496,27 @@ void runRagebot(
             }
         }
 
-        // �����������: ���� ����� ��������� ����� �� ������ - ���������� �����
+
         if (i == Hitboxes::Head && bestTarget.notNull() && damageDiff < 10.0f)
             break;
     }
 
-    // Hit chance ��������
+
     if (bestTarget.notNull())
     {
         bool hitChanceOverrideActive = config->hitchanceOverride.isActive() && cfg1[weaponIndex].hcov;
         int requiredHitChance = hitChanceOverrideActive ?
             cfg1[weaponIndex].OvrHitChance : cfg1[weaponIndex].hitChance;
 
+        float dynamicHitchance = calculateDynamicHitchance(
+            localPlayer.get(),
+            entity,
+            activeWeapon,
+            bestAngle,
+            requiredHitChance
+        );
+
+        // Затем проверяем с динамическим значением
         if (!AimbotFunction::hitChance(
             localPlayer.get(),
             entity,
@@ -434,7 +525,7 @@ void runRagebot(
             activeWeapon,
             bestAngle,
             cmd,
-            requiredHitChance))
+            static_cast<int>(dynamicHitchance)))
         {
             bestTarget = Vector{};
             bestAngle = Vector{};
@@ -565,7 +656,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             false : (cfg1[weaponIndex].hitboxes & (1 << 8)) == (1 << 8);
     }
 
-    // �������� enemies
+
     std::vector<Ragebot::Enemies> enemies;
     const auto& localPlayerOrigin = localPlayer->getAbsOrigin();
 
@@ -597,7 +688,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
     if (enemies.empty())
         return;
 
-    // ���������� enemies
+
     switch (cfg.priority)
     {
     case 0:
@@ -616,7 +707,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
     auto multiPointHead = cfg1[weaponIndex].multiPointHead;
     auto multiPointBody = cfg1[weaponIndex].multiPointBody;
 
-    // ������������ ������ enemy
+
     for (const auto& target : enemies)
     {
         auto entity = interfaces->entityList->getEntity(target.id);
@@ -634,7 +725,6 @@ void Ragebot::run(UserCmd* cmd) noexcept
         Vector backupOrigin = entity->getAbsOrigin();
         Vector backupAbsAngle = entity->getAbsAngle();
 
-        // ��������� ��� ����� (current + backtrack)
         for (size_t cycle = 0; cycle < 2; cycle++)
         {
             auto update = player_records[cycle].empty() ||
@@ -668,7 +758,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
 
                 if (cycle == 0)
                 {
-                    // ���� ������ tick
+
                     for (size_t i = 0; i < records->size(); i++)
                     {
                         if (Backtrack::valid(records->at(i).simulationTime))
@@ -680,7 +770,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
                 }
                 else
                 {
-                    // �������� �����
+
                     for (int i = static_cast<int>(records->size() - 1U); i >= 0; i--)
                     {
                         if (Backtrack::valid(records->at(i).simulationTime))
@@ -694,7 +784,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
                 if (bestTick <= -1)
                     continue;
 
-                // ������������� backtrack �������
+
                 memcpy(entity->getBoneCache().memory, records->at(bestTick).matrix,
                     std::clamp(entity->getBoneCache().size, 0, MAXSTUDIOBONES) * sizeof(matrix3x4));
                 memory->setAbsOrigin(entity, records->at(bestTick).origin);
@@ -707,7 +797,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             }
             else
             {
-                // ��� backtrack - ������� ������ ����
+
                 if (cycle == 1)
                     continue;
 
@@ -723,7 +813,6 @@ void Ragebot::run(UserCmd* cmd) noexcept
             // Resolver
             Resolver::resolve_shot(const_cast<Animations::Players&>(player), entity);
 
-            // ��������� ������������
             runRagebot(
                 cmd,
                 entity,
@@ -757,7 +846,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             break;
     }
 
-    // ���� ����� ���� - ������� � ��������
+
     if (bestTarget.notNull())
     {
         static Vector lastAngles{ cmd->viewangles };
@@ -803,7 +892,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
         {
             cmd->tickCount = timeToTicks(bestSimulationTime + Backtrack::getLerp());
 
-            Resolver::saveShot(bestIndex, bestTarget, bestSimulationTime);
+            Resolver::saveRecord(bestIndex, bestSimulationTime);
             Resolver::processMissedShots();
         }
 
