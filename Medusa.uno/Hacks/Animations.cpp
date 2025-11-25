@@ -1,154 +1,346 @@
-
-
-#include "../Memory.h"
-#include "../Interfaces.h"
-#include <intrin.h>
 #include "Animations.h"
+#include "Resolver.h"
 #include "Backtrack.h"
 #include "EnginePrediction.h"
-#include "Resolver.h"
 #include "AntiAim.h"
+#include "../Memory.h"
+#include "../Interfaces.h"
+#include "../Helpers.h"
 #include "../SDK/LocalPlayer.h"
 #include "../SDK/Cvar.h"
 #include "../SDK/GlobalVars.h"
-#include "../SDK/Entity.h"
-#include "../SDK/UserCmd.h"
 #include "../SDK/ConVar.h"
 #include "../SDK/MemAlloc.h"
 #include "../SDK/Input.h"
-#include "../SDK/Vector.h"
-#include "../Hooks.h"
+#include "../Config.h"
 #include "../xor.h"
+#include <algorithm>
+#include <cmath>
 
-// Глобальные переменные
-static bool lockAngles = false;
-static Vector holdAimAngles;
-static Vector anglesToAnimate;
-static std::array<Animations::Players, 65> players{};
-static std::array<matrix3x4, MAXSTUDIOBONES> fakematrix{};
-static std::array<matrix3x4, MAXSTUDIOBONES> fakelagmatrix{};
-static std::array<matrix3x4, MAXSTUDIOBONES> realmatrix{};
-static Vector localAngle{};
-static Vector sentViewangles{};
-static bool updatingLocal{ true };
-static bool updatingEntity{ false };
-static bool updatingFake{ false };
-static bool sendPacket{ true };
-static bool gotMatrix{ false };
-static bool gotMatrixFakelag{ false };
-static bool gotMatrixReal{ false };
-static Vector viewangles{};
-static Vector correctAngle{};
-static int buildTransformsIndex = -1;
-static std::array<AnimationLayer, 13> staticLayers{};
-static std::array<AnimationLayer, 13> layers{};
-static float primaryCycle{ 0.0f };
-static float moveWeight{ 0.0f };
-static float footYaw{};
-static std::array<float, 24> poseParameters{};
-static std::array<AnimationLayer, 13> sendPacketLayers{};
+// ============================================
+// GLOBAL STATE (anonymous namespace)
+// ============================================
 
-enum ADVANCED_ACTIVITY : int
-{
-    ACTIVITY_NONE = 0,
-    ACTIVITY_JUMP,
-    ACTIVITY_LAND,
-    ACTIVE_LAND_LIGHT,
-    ACTIVE_LAND_HEAVY
-};
+namespace {
+    std::array<Animations::Players, 65> players{};
 
-void Animations::init() noexcept
-{
-    static auto threadedBoneSetup = interfaces->cvar->findVar("cl_threaded_bone_setup");
-    threadedBoneSetup->setValue(1);
+    // Local player matrices
+    std::array<matrix3x4, MAXSTUDIOBONES> fakematrix{};
+    std::array<matrix3x4, MAXSTUDIOBONES> fakelagmatrix{};
+    std::array<matrix3x4, MAXSTUDIOBONES> realmatrix{};
 
-    static auto extrapolate = interfaces->cvar->findVar("cl_extrapolate");
-    extrapolate->setValue(0);
+    // Local player state
+    Vector localAngle{};
+    Vector sentViewangles{};
+    Vector viewangles{};
+    Vector correctAngle{};
+
+    // State flags
+    bool updatingLocal = true;
+    bool updatingEntity = false;
+    bool updatingFake = false;
+    bool sendPacket = true;
+    bool gotMatrix = false;
+    bool gotMatrixFakelag = false;
+    bool gotMatrixReal = false;
+
+    // Build transforms
+    int buildTransformsIndex = -1;
+
+    // Animation state backups
+    std::array<AnimationLayer, ANIMATION_LAYER_COUNT> staticLayers{};
+    std::array<AnimationLayer, ANIMATION_LAYER_COUNT> layers{};
+    std::array<AnimationLayer, ANIMATION_LAYER_COUNT> sendPacketLayers{};
+    std::array<float, 24> poseParameters{};
+
+    float footYaw = 0.f;
+    float primaryCycle = 0.f;
+    float moveWeight = 0.f;
+
+    // Fake animation state
+    AnimState* fakeAnimState = nullptr;
+    bool fakeAnimInitialized = false;
+    float fakeSpawnTime = 0.f;
+
+    // ============================================
+    // HELPER STRUCTURES
+    // ============================================
+
+    struct GlobalVarsBackup {
+        float currenttime;
+        float frametime;
+        float realtime;
+        float absoluteFrameTime;
+        int framecount;
+        int tickCount;
+        float interpolationAmount;
+
+        void save() noexcept {
+            currenttime = memory->globalVars->currenttime;
+            frametime = memory->globalVars->frametime;
+            realtime = memory->globalVars->realtime;
+            absoluteFrameTime = memory->globalVars->absoluteFrameTime;
+            framecount = memory->globalVars->framecount;
+            tickCount = memory->globalVars->tickCount;
+            interpolationAmount = memory->globalVars->interpolationAmount;
+        }
+
+        void restore() noexcept {
+            memory->globalVars->currenttime = currenttime;
+            memory->globalVars->frametime = frametime;
+            memory->globalVars->realtime = realtime;
+            memory->globalVars->absoluteFrameTime = absoluteFrameTime;
+            memory->globalVars->framecount = framecount;
+            memory->globalVars->tickCount = tickCount;
+            memory->globalVars->interpolationAmount = interpolationAmount;
+        }
+    };
+
+    struct EntityStateBackup {
+        std::array<AnimationLayer, ANIMATION_LAYER_COUNT> layers{};
+        std::array<float, 24> poseParams{};
+        Vector absAngle{};
+        float lby = 0.f;
+        float duckAmount = 0.f;
+        int flags = 0;
+        uintptr_t effects = 0;
+
+        void save(Entity* entity) noexcept {
+            if (!entity) return;
+            std::memcpy(layers.data(), entity->animOverlays(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+            poseParams = entity->poseParameters();
+            absAngle = entity->getAbsAngle();
+            lby = entity->lby();
+            duckAmount = entity->duckAmount();
+            flags = entity->flags();
+            effects = entity->getEffects();
+        }
+
+        void restore(Entity* entity) noexcept {
+            if (!entity) return;
+            std::memcpy(entity->animOverlays(), layers.data(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+            entity->poseParameters() = poseParams;
+            entity->lby() = lby;
+            entity->duckAmount() = duckAmount;
+            entity->flags() = flags;
+            entity->getEffects() = effects;
+        }
+    };
+
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+
+    float getMaxSpeed(Entity* entity) noexcept {
+        if (!entity) return CS_PLAYER_SPEED_RUN;
+
+        float maxSpeed = CS_PLAYER_SPEED_RUN;
+
+        if (auto weapon = entity->getActiveWeapon()) {
+            if (auto weaponData = weapon->getWeaponData()) {
+                maxSpeed = entity->isScoped() ?
+                    weaponData->maxSpeedAlt : weaponData->maxSpeed;
+                maxSpeed = std::fmaxf(maxSpeed, 0.001f);
+            }
+        }
+
+        if (entity->duckAmount() >= 1.0f)
+            maxSpeed *= CS_PLAYER_SPEED_DUCK_MODIFIER;
+        else if (entity->is_walking())
+            maxSpeed *= CS_PLAYER_SPEED_WALK_MODIFIER;
+
+        return maxSpeed;
+    }
+
+    float getExtraTicks() noexcept {
+        if (!config->backtrack.fakeLatency || config->backtrack.fakeLatencyAmount <= 0)
+            return 0.f;
+        return static_cast<float>(config->backtrack.fakeLatencyAmount) / 1000.f;
+    }
+
+    void setGlobalVarsForTick(float time) noexcept {
+        memory->globalVars->currenttime = time;
+        memory->globalVars->realtime = time;
+        memory->globalVars->frametime = memory->globalVars->intervalPerTick;
+        memory->globalVars->absoluteFrameTime = memory->globalVars->intervalPerTick;
+        memory->globalVars->framecount = timeToTicks(time);
+        memory->globalVars->tickCount = timeToTicks(time);
+        memory->globalVars->interpolationAmount = 0.0f;
+    }
+
+    void prepareEntityForUpdate(Entity* entity) noexcept {
+        if (!entity || !entity->getAnimstate()) return;
+
+        entity->getEFlags() &= ~0x1000;
+        entity->getEffects() |= 8;
+
+        if (entity->getAnimstate()->lastUpdateFrame == memory->globalVars->framecount)
+            entity->getAnimstate()->lastUpdateFrame -= 1;
+
+        if (entity->getAnimstate()->lastUpdateTime == memory->globalVars->currenttime)
+            entity->getAnimstate()->lastUpdateTime += ticksToTime(1);
+    }
+
+    void applyAnimationBreakers() noexcept {
+        if (!localPlayer || !localPlayer->getAnimstate())
+            return;
+
+        const bool slowwalk = config->misc.slowwalk && config->misc.slowwalkKey.isActive();
+
+        // Static breaks
+        if (config->condAA.animBreakers & (1 << 0)) {
+            localPlayer->setPoseParameter(1, 6);
+        }
+        else {
+            localPlayer->setPoseParameter(0, 6);
+        }
+
+        // Landing break
+        if (config->condAA.animBreakers & (1 << 1)) {
+            static float endTime = 0.f;
+            if (localPlayer->getAnimstate()->landing) {
+                endTime = memory->globalVars->currenttime + 3.5f;
+            }
+
+            if (endTime > memory->globalVars->currenttime) {
+                localPlayer->setPoseParameter(2, 12);
+            }
+        }
+
+        // Zero pitch
+        if (config->condAA.animBreakers & (1 << 2)) {
+            localPlayer->poseParameters()[8] = 0;
+            localPlayer->poseParameters()[9] = 0;
+            localPlayer->poseParameters()[10] = 0;
+        }
+
+        // Movement weight
+        if ((config->condAA.animBreakers & (1 << 3)) && !slowwalk) {
+            if (localPlayer->velocity().length2D() > 2.5f &&
+                !(localPlayer->flags() & FL_ONGROUND)) {
+                auto* moveLayer = localPlayer->getAnimationLayer(ANIMATION_LAYER_MOVEMENT_MOVE);
+                if (moveLayer) moveLayer->weight = 1.f;
+            }
+        }
+    }
 }
 
-void Animations::reset() noexcept
-{
+// ============================================
+// INITIALIZATION
+// ============================================
+
+void Animations::init() noexcept {
+    static auto threadedBoneSetup = interfaces->cvar->findVar("cl_threaded_bone_setup");
+    if (threadedBoneSetup) threadedBoneSetup->setValue(1);
+
+    static auto extrapolate = interfaces->cvar->findVar("cl_extrapolate");
+    if (extrapolate) extrapolate->setValue(0);
+}
+
+void Animations::reset() noexcept {
     for (auto& record : players)
         record.reset();
-    fakematrix = {};
-    fakelagmatrix = {};
-    realmatrix = {};
+
+    for (auto& m : fakematrix) m = matrix3x4{};
+    for (auto& m : fakelagmatrix) m = matrix3x4{};
+    for (auto& m : realmatrix) m = matrix3x4{};
+
     localAngle = Vector{};
+    sentViewangles = Vector{};
+    viewangles = Vector{};
+    correctAngle = Vector{};
+
     updatingLocal = true;
     updatingEntity = false;
+    updatingFake = false;
     sendPacket = true;
     gotMatrix = false;
     gotMatrixFakelag = false;
     gotMatrixReal = false;
-    viewangles = Vector{};
-    correctAngle = Vector{};
+
     buildTransformsIndex = -1;
-    staticLayers = {};
-    layers = {};
-    primaryCycle = 0.0f;
-    moveWeight = 0.0f;
-    footYaw = {};
-    poseParameters = {};
-    sendPacketLayers = {};
+
+    for (auto& l : staticLayers) l = AnimationLayer{};
+    for (auto& l : layers) l = AnimationLayer{};
+    for (auto& l : sendPacketLayers) l = AnimationLayer{};
+    poseParameters.fill(0.f);
+
+    footYaw = 0.f;
+    primaryCycle = 0.f;
+    moveWeight = 0.f;
+
+    fakeAnimState = nullptr;
+    fakeAnimInitialized = false;
+    fakeSpawnTime = 0.f;
 }
 
-// УЛУЧШЕННАЯ ФУНКЦИЯ: правильное обновление velocity
-static Vector calculateVelocity(const Vector& origin, const Vector& prevOrigin, float simTime, float prevSimTime) noexcept
-{
-    if (prevOrigin.notNull() && simTime != prevSimTime)
-    {
-        const float timeDelta = simTime - prevSimTime;
-        if (timeDelta > 0.0f && timeDelta < 1.0f) // Санитарная проверка
-        {
-            return (origin - prevOrigin) * (1.0f / timeDelta);
+// ============================================
+// VELOCITY CALCULATION
+// ============================================
+
+Vector Animations::calculateVelocity(Entity* entity, Players& record) noexcept {
+    if (!entity)
+        return Vector{};
+
+    if (record.oldOrigin.notNull() && record.simulationTime > 0.f) {
+        const float timeDelta = entity->simulationTime() - record.simulationTime;
+
+        if (timeDelta > 0.0f && timeDelta < 1.0f) {
+            return (entity->origin() - record.oldOrigin) * (1.0f / timeDelta);
         }
     }
-    return Vector{ 0.0f, 0.0f, 0.0f };
+
+    return entity->velocity();
 }
 
-// НОВАЯ ФУНКЦИЯ: улучшенный расчет ground velocity
-static void fixVelocity(Animations::Players& record, Entity* entity) noexcept
-{
+void Animations::fixVelocity(Entity* entity, Players& record) noexcept {
     if (!entity)
         return;
 
     Vector velocity = record.velocity;
 
-    // Ground velocity fix
-    if (entity->flags() & FL_ONGROUND)
-    {
+    if (entity->flags() & FL_ONGROUND) {
         velocity.z = 0.0f;
 
-        // Правильный расчет скорости на основе animation layer
-        if (record.layers[ANIMATION_LAYER_ALIVELOOP].weight > 0.0f &&
-            record.layers[ANIMATION_LAYER_ALIVELOOP].weight < 1.0f &&
-            record.layers[ANIMATION_LAYER_ALIVELOOP].cycle > record.oldlayers[ANIMATION_LAYER_ALIVELOOP].cycle)
-        {
-            const auto weapon = entity->getActiveWeapon();
-            const float maxSpeed = weapon ? std::fmaxf(weapon->getMaxSpeed(), 0.001f) : CS_PLAYER_SPEED_RUN;
+        const auto& aliveLoop = record.layers[ANIMATION_LAYER_ALIVELOOP];
+        const auto& oldAliveLoop = record.oldlayers[ANIMATION_LAYER_ALIVELOOP];
 
-            const float weightDelta = 1.0f - record.layers[ANIMATION_LAYER_ALIVELOOP].weight;
-            const float speedFraction = (weightDelta / 2.8571432f) + 0.55f;
+        if (aliveLoop.weight > 0.0f && aliveLoop.weight < 1.0f) {
+            if (aliveLoop.cycle > oldAliveLoop.cycle ||
+                (aliveLoop.cycle < 0.1f && oldAliveLoop.cycle > 0.9f)) {
 
-            if (speedFraction > 0.0f)
-            {
-                const float speed = speedFraction * maxSpeed;
-                const float currentSpeed = velocity.length2D();
+                const float maxSpeed = getMaxSpeed(entity);
+                const float weightDelta = 1.0f - aliveLoop.weight;
+                float speedFraction = (weightDelta / 2.8571432f) + 0.55f;
 
-                if (speed > 0.0f && currentSpeed > 0.0f)
-                {
-                    velocity.x = (velocity.x / currentSpeed) * speed;
-                    velocity.y = (velocity.y / currentSpeed) * speed;
+                speedFraction = std::clamp(speedFraction, 0.0f, 1.0f);
+
+                if (speedFraction > 0.0f) {
+                    const float targetSpeed = speedFraction * maxSpeed;
+                    const float currentSpeed = velocity.length2D();
+
+                    if (currentSpeed > 0.1f && targetSpeed > 0.1f) {
+                        const float speedRatio = targetSpeed / currentSpeed;
+                        velocity.x *= speedRatio;
+                        velocity.y *= speedRatio;
+                    }
                 }
             }
         }
+
+        const float maxSpeed = getMaxSpeed(entity);
+        const float speed = velocity.length2D();
+        if (speed > maxSpeed) {
+            const float ratio = maxSpeed / speed;
+            velocity.x *= ratio;
+            velocity.y *= ratio;
+        }
     }
-    else
-    {
-        // Gravity для воздуха
-        static auto gravity = interfaces->cvar->findVar(skCrypt("sv_gravity"));
-        if (gravity)
-        {
+    else {
+        static auto gravity = interfaces->cvar->findVar("sv_gravity");
+        if (gravity) {
             velocity.z -= gravity->getFloat() * 0.5f * memory->globalVars->intervalPerTick;
         }
     }
@@ -156,353 +348,380 @@ static void fixVelocity(Animations::Players& record, Entity* entity) noexcept
     record.velocity = velocity;
 }
 
-// УЛУЧШЕННАЯ ФУНКЦИЯ: определение активности (jump/land)
-static int detectActivity(Animations::Players& record, Animations::Players& prevRecord, Entity* entity) noexcept
-{
+// ============================================
+// ACTIVITY DETECTION
+// ============================================
+
+ActivityType Animations::detectActivity(Entity* entity, Players& record) noexcept {
     if (!entity)
         return ACTIVITY_NONE;
 
-    // Detect landing
-    if ((record.layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate <= 0.f ||
-        record.layers[ANIMATION_LAYER_MOVEMENT_MOVE].weight <= 0.f) &&
-        (entity->flags() & FL_ONGROUND))
-    {
-        int activity = entity->sequenceDuration(record.layers[ANIMATION_LAYER_MOVEMENT_LAND_OR_CLIMB].sequence);
+    const auto& jumpLayer = record.layers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL];
+    const auto& oldJumpLayer = record.oldlayers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL];
+    const auto& landLayer = record.layers[ANIMATION_LAYER_MOVEMENT_LAND_OR_CLIMB];
 
-        if (activity == ACTIVE_LAND_LIGHT || activity == ACTIVE_LAND_HEAVY)
-        {
-            float landTime = record.layers[ANIMATION_LAYER_MOVEMENT_LAND_OR_CLIMB].cycle /
-                record.layers[ANIMATION_LAYER_MOVEMENT_LAND_OR_CLIMB].playbackRate;
-
-            if (landTime > 0.f)
-                return ACTIVITY_LAND;
+    if (jumpLayer.weight > 0.0f && oldJumpLayer.weight <= 0.0f) {
+        if (jumpLayer.cycle < 0.5f) {
+            return ACTIVITY_JUMP;
         }
     }
 
-    // Detect jump
-    if (record.layers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL].weight > 0.0f &&
-        prevRecord.layers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL].weight <= 0.0f)
-    {
-        int activity = entity->sequenceDuration(record.layers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL].sequence);
-
-        if (activity == ACTIVITY_JUMP)
-        {
-            float jumpTime = record.layers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL].cycle /
-                record.layers[ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL].playbackRate;
-
-            if (jumpTime > 0.f)
-                return ACTIVITY_JUMP;
+    if (entity->flags() & FL_ONGROUND) {
+        if (landLayer.weight > 0.0f && landLayer.cycle < 0.5f) {
+            if (landLayer.playbackRate > 0.5f) {
+                return ACTIVITY_LAND_HEAVY;
+            }
+            return ACTIVITY_LAND_LIGHT;
         }
     }
 
     return ACTIVITY_NONE;
 }
 
-float getExtraTicks() noexcept
-{
-    if (!config->backtrack.fakeLatency || config->backtrack.fakeLatencyAmount <= 0)
-        return 0.f;
-    return static_cast<float>(config->backtrack.fakeLatencyAmount) / 1000.f;
+// ============================================
+// LAYER COMPARISON
+// ============================================
+
+float Animations::compareLayerDelta(const AnimationLayer& a, const AnimationLayer& b) noexcept {
+    float delta = 0.0f;
+
+    delta += std::fabsf(a.weight - b.weight) * 2.0f;
+    delta += std::fabsf(a.cycle - b.cycle);
+    delta += std::fabsf(a.playbackRate - b.playbackRate) * 0.5f;
+
+    return delta;
 }
 
-void Animations::handlePlayers(FrameStage stage) noexcept
-{
+bool Animations::isLayerActive(const AnimationLayer& layer) noexcept {
+    return layer.weight > 0.0f && layer.playbackRate != 0.0f;
+}
+
+// ============================================
+// ENTITY SIMULATION
+// ============================================
+
+void Animations::simulateEntity(Entity* entity, Players& record, int ticks) noexcept {
+    if (!entity || !entity->getAnimstate() || ticks <= 0)
+        return;
+
+    record.simulatedTicks.clear();
+    record.simulatedTicks.reserve(ticks);
+
+    GlobalVarsBackup gvBackup;
+    gvBackup.save();
+
+    EntityStateBackup entityBackup;
+    entityBackup.save(entity);
+
+    const float startTime = record.simulationTime;
+    const float endTime = entity->simulationTime();
+    const float timeDelta = endTime - startTime;
+
+    if (timeDelta <= 0.0f)
+        return;
+
+    for (int tick = 0; tick < ticks; tick++) {
+        const float lerpFactor = static_cast<float>(tick + 1) / static_cast<float>(ticks);
+        const float simulatedTime = startTime + (timeDelta * lerpFactor);
+
+        SimulatedTick simTick;
+        simTick.time = simulatedTime;
+
+        simTick.origin = Helpers::lerp(lerpFactor, record.oldOrigin, entity->origin());
+        simTick.velocity = Helpers::lerp(lerpFactor, record.oldVelocity, record.velocity);
+        simTick.duckAmount = Helpers::lerp(lerpFactor, record.oldDuckAmount, entity->duckAmount());
+
+        if (record.activity == ACTIVITY_JUMP && tick == 0) {
+            simTick.flags = entity->flags() | FL_ONGROUND;
+        }
+        else if (record.activity == ACTIVITY_JUMP && tick == 1) {
+            simTick.flags = entity->flags() & ~FL_ONGROUND;
+        }
+        else {
+            simTick.flags = entity->flags();
+        }
+
+        setGlobalVarsForTick(simulatedTime);
+        entity->getAbsVelocity() = simTick.velocity;
+        entity->duckAmount() = simTick.duckAmount;
+        entity->flags() = simTick.flags;
+
+        if (record.activity == ACTIVITY_JUMP && tick == 1) {
+            auto* jumpLayer = entity->getAnimationLayer(ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL);
+            if (jumpLayer) jumpLayer->cycle = 0.0f;
+        }
+
+        prepareEntityForUpdate(entity);
+        entity->updateClientSideAnimation();
+
+        std::memcpy(simTick.layers.data(), entity->animOverlays(),
+            sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+        simTick.poseParameters = entity->poseParameters();
+
+        record.simulatedTicks.push_back(simTick);
+    }
+
+    gvBackup.restore();
+    entityBackup.restore(entity);
+}
+
+void Animations::simulateSide(Entity* entity, Players& record, float yaw,
+    std::array<AnimationLayer, ANIMATION_LAYER_COUNT>& outLayers,
+    std::array<matrix3x4, MAXSTUDIOBONES>& outMatrix) noexcept {
+    if (!entity || !entity->getAnimstate())
+        return;
+
+    GlobalVarsBackup gvBackup;
+    gvBackup.save();
+
+    EntityStateBackup entityBackup;
+    entityBackup.save(entity);
+
+    memory->globalVars->currenttime = entity->simulationTime();
+    memory->globalVars->frametime = memory->globalVars->intervalPerTick;
+
+    entity->getEFlags() &= ~0x1000;
+    entity->getAbsVelocity() = record.velocity;
+
+    auto* animState = entity->getAnimstate();
+    animState->footYaw = yaw;
+
+    prepareEntityForUpdate(entity);
+    entity->updateClientSideAnimation();
+
+    std::memcpy(outLayers.data(), entity->animOverlays(),
+        sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+
+    memory->setAbsAngle(entity, Vector{ 0, yaw, 0 });
+    entity->setupBones(outMatrix.data(), MAXSTUDIOBONES, 0x7FF00, memory->globalVars->currenttime);
+
+    gvBackup.restore();
+    entityBackup.restore(entity);
+}
+
+void Animations::rebuildAnimationState(Entity* entity, Players& record) noexcept {
+    if (!entity || !entity->getAnimstate())
+        return;
+
+    auto* animState = entity->getAnimstate();
+
+    const float speed = record.velocity.length2D();
+    const float maxSpeed = getMaxSpeed(entity);
+
+    animState->velocityLengthXY = speed;
+    animState->velocityLengthZ = record.velocity.z;
+
+    if (maxSpeed > 0.0f) {
+        animState->speedAsPortionOfWalkTopSpeed = speed / (maxSpeed * CS_PLAYER_SPEED_WALK_MODIFIER);
+        animState->speedAsPortionOfCrouchTopSpeed = speed / (maxSpeed * CS_PLAYER_SPEED_DUCK_MODIFIER);
+        animState->speedAsPortionOfRunTopSpeed = speed / maxSpeed;
+    }
+
+    animState->animDuckAmount = record.duckAmount;
+    animState->onGround = (record.flags & FL_ONGROUND) != 0;
+}
+
+// ============================================
+// MAIN PLAYER HANDLING
+// ============================================
+
+void Animations::handlePlayers(FrameStage stage) noexcept {
     if (stage != FrameStage::NET_UPDATE_END)
         return;
 
-    if (!localPlayer)
-    {
+    if (!localPlayer) {
         for (auto& record : players)
             record.clear();
         return;
     }
 
     float latency = 0.0f;
-    if (auto networkChannel = interfaces->engine->getNetworkChannel();
-        networkChannel && networkChannel->getLatency(0) > 0.0f && !config->backtrack.fakeLatency)
-    {
-        latency = networkChannel->getLatency(0);
+    if (auto networkChannel = interfaces->engine->getNetworkChannel()) {
+        if (networkChannel->getLatency(0) > 0.0f && !config->backtrack.fakeLatency) {
+            latency = networkChannel->getLatency(0);
+        }
     }
 
-    static auto gravity = interfaces->cvar->findVar(skCrypt("sv_gravity"));
-    const float timeLimit = static_cast<float>(config->backtrack.timeLimit) / 1000.f + getExtraTicks() + latency;
+    const float timeLimit = static_cast<float>(config->backtrack.timeLimit) / 1000.f +
+        getExtraTicks() + latency;
 
-    for (int i = 1; i <= interfaces->engine->getMaxClients(); i++)
-    {
+    for (int i = 1; i <= interfaces->engine->getMaxClients(); i++) {
         const auto entity = interfaces->entityList->getEntity(i);
-        auto& records = players.at(i);
-        auto& prev_records = players.at(i);
+        auto& record = players.at(i);
 
-        if (!entity || entity == localPlayer.get() || entity->isDormant() || !entity->isAlive())
-        {
-            records.clear();
-            prev_records.clear();
+        if (!entity || entity == localPlayer.get() || entity->isDormant() || !entity->isAlive()) {
+            record.clear();
             continue;
         }
 
-        if (entity->spawnTime() != records.spawnTime)
-        {
-            records.spawnTime = entity->spawnTime();
-            records.reset();
+        if (entity->spawnTime() != record.spawnTime) {
+            record.spawnTime = entity->spawnTime();
+            record.reset();
         }
 
-        // Backup layers
-        std::array<AnimationLayer, 13> layersBackup;
-        std::memcpy(&layersBackup, entity->animOverlays(), sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-        std::memcpy(&records.centerLayer, entity->animOverlays(), sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-        std::memcpy(&records.leftLayer, entity->animOverlays(), sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-        std::memcpy(&records.rightLayer, entity->animOverlays(), sizeof(AnimationLayer) * entity->getAnimationLayersCount());
+        EntityStateBackup entityBackup;
+        entityBackup.save(entity);
 
-        const auto lowerBodyYawTarget = entity->lby();
-        const auto duckAmount = entity->duckAmount();
-        const auto flags = entity->flags();
+        GlobalVarsBackup gvBackup;
+        gvBackup.save();
 
-        const auto currentTime = memory->globalVars->currenttime;
-        const auto frameTime = memory->globalVars->frametime;
-        const auto realTime = memory->globalVars->realtime;
-        const auto frameCount = memory->globalVars->framecount;
-        const auto absoluteFT = memory->globalVars->absoluteFrameTime;
-        const auto tickCount = memory->globalVars->tickCount;
-        const auto interpolationAmount = memory->globalVars->interpolationAmount;
+        const float newSimTime = entity->simulationTime();
+        const bool simTimeUpdated = record.simulationTime != newSimTime &&
+            record.simulationTime < newSimTime;
 
-        memory->globalVars->currenttime = entity->simulationTime();
-        memory->globalVars->frametime = memory->globalVars->intervalPerTick;
+        if (simTimeUpdated) {
+            // Store old values
+            record.oldSimulationTime = record.simulationTime;
+            record.oldOrigin = record.origin;
+            record.oldVelocity = record.velocity;
+            record.oldDuckAmount = record.duckAmount;
+            record.oldFlags = record.flags;
+            record.oldLby = record.lby;
+            std::memcpy(record.oldlayers.data(), record.layers.data(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+            record.oldPoseParameters = record.poseParameters;
+            record.lastChokedPackets = record.chokedPackets;
+            record.lastSide = record.side;
 
-        const uintptr_t backupEffects = entity->getEffects();
-        entity->getEffects() |= 8;
+            // Update current values
+            record.simulationTime = newSimTime;
+            record.origin = entity->origin();
+            record.lby = entity->lby();
+            record.duckAmount = entity->duckAmount();
+            record.flags = entity->flags();
+            std::memcpy(record.layers.data(), entity->animOverlays(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+            record.poseParameters = entity->poseParameters();
 
-        bool runPostUpdate = false;
+            // Calculate choked packets
+            const float simDelta = newSimTime - record.oldSimulationTime;
+            if (simDelta > 0.0f && record.oldSimulationTime > 0.0f) {
+                record.chokedPackets = static_cast<int>(
+                    std::round(simDelta / memory->globalVars->intervalPerTick)) - 1;
+                record.chokedPackets = std::clamp(record.chokedPackets, 0, maxUserCmdProcessTicks);
+            }
+            else {
+                record.chokedPackets = 0;
+            }
 
-        if (records.simulationTime != entity->simulationTime() && records.simulationTime < entity->simulationTime())
-        {
-            runPostUpdate = true;
-
-            if (records.simulationTime == -1.0f)
-                records.simulationTime = entity->simulationTime();
-
-            // Backup old layers
-            if (!records.layers.empty())
-                std::memcpy(&records.oldlayers, &records.layers, sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-
-            std::memcpy(&records.layers, entity->animOverlays(), sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-
-            // УЛУЧШЕНИЕ: правильный расчет choked packets
-            const float simDifference = entity->simulationTime() - records.simulationTime;
-            records.chokedPackets = simDifference > 0.0f ?
-                static_cast<int>(std::round(simDifference / memory->globalVars->intervalPerTick)) - 1 : 0;
-            records.chokedPackets = std::clamp(records.chokedPackets, 0, maxUserCmdProcessTicks);
-
-            // УЛУЧШЕНИЕ: правильный расчет velocity
-            records.velocity = calculateVelocity(
-                entity->origin(),
-                records.origin,
-                entity->simulationTime(),
-                records.simulationTime
-            );
-
-            // Fix velocity
-            fixVelocity(records, entity);
-
-            // Update other data
-            records.moveWeight = entity->getAnimstate()->moveWeight;
-            records.flags = entity->flags();
-            records.oldDuckAmount = records.duckAmount;
-            records.duckAmount = entity->duckAmount();
-            records.oldOrigin = records.origin;
-            records.origin = entity->origin();
+            // Calculate velocity
+            record.velocity = calculateVelocity(entity, record);
+            fixVelocity(entity, record);
 
             // Detect activity
-            int activity = detectActivity(records, prev_records, entity);
+            record.activity = detectActivity(entity, record);
+            if (record.activity != ACTIVITY_NONE) {
+                record.activityStartTime = memory->globalVars->currenttime;
+            }
+
+            // Setup for animation update
+            memory->globalVars->currenttime = newSimTime;
+            memory->globalVars->frametime = memory->globalVars->intervalPerTick;
+            entity->getEffects() |= 8;
 
             // Run resolver pre-update
-            Resolver::runPreUpdate(records, prev_records, entity);
+            Resolver::update(entity, record);
 
-            // УЛУЧШЕНИЕ: правильная симуляция missing ticks
+            // Simulate animation
             updatingEntity = true;
 
-            if (records.chokedPackets <= 0)
-            {
-                // No choke - simple update
-                if (entity->getAnimstate()->lastUpdateFrame == memory->globalVars->framecount)
-                    entity->getAnimstate()->lastUpdateFrame -= 1;
-
-                if (entity->getAnimstate()->lastUpdateTime == memory->globalVars->currenttime)
-                    entity->getAnimstate()->lastUpdateTime += ticksToTime(1);
-
-                entity->getEFlags() &= ~0x1000;
-                entity->getAbsVelocity() = records.velocity;
+            if (record.chokedPackets <= 0) {
+                entity->getAbsVelocity() = record.velocity;
+                prepareEntityForUpdate(entity);
                 entity->updateClientSideAnimation();
             }
-            else
-            {
-                // КРИТИЧЕСКОЕ УЛУЧШЕНИЕ: правильная симуляция каждого choked tick
-                for (int tick = 0; tick <= records.chokedPackets; tick++)
-                {
-                    const float simulatedTime = records.simulationTime + (memory->globalVars->intervalPerTick * (tick + 1));
-                    const float lerpValue = static_cast<float>(tick + 1) / static_cast<float>(records.chokedPackets + 1);
+            else {
+                simulateEntity(entity, record, record.chokedPackets + 1);
 
-                    // Backup current time
-                    const float currentTimeBackup = memory->globalVars->currenttime;
-
-                    // Setup simulated time
-                    memory->globalVars->currenttime = simulatedTime;
-                    memory->globalVars->realtime = simulatedTime;
-                    memory->globalVars->frametime = memory->globalVars->intervalPerTick;
-                    memory->globalVars->absoluteFrameTime = memory->globalVars->intervalPerTick;
-                    memory->globalVars->framecount = timeToTicks(simulatedTime);
-                    memory->globalVars->tickCount = timeToTicks(simulatedTime);
-                    memory->globalVars->interpolationAmount = 0.0f;
-
-                    // Handle activity (jump/land)
-                    if (activity == ACTIVITY_JUMP || activity == ACTIVITY_LAND)
-                    {
-                        // Set proper flags for jump/land
-                        if (tick == 0 && activity == ACTIVITY_JUMP)
-                        {
-                            entity->flags() |= FL_ONGROUND;
-                        }
-                        else if (tick == 1 && activity == ACTIVITY_JUMP)
-                        {
-                            entity->flags() &= ~FL_ONGROUND;
-                            entity->getAnimationLayer(ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL)->cycle = 0.f;
-                        }
-                    }
-
-                    // Interpolate values
-                    entity->getEFlags() &= ~0x1000;
-                    entity->getAbsVelocity() = Helpers::lerp(lerpValue, records.oldVelocity, records.velocity);
-                    entity->duckAmount() = Helpers::lerp(lerpValue, records.oldDuckAmount, records.duckAmount);
-
-                    // Update animation state
-                    if (entity->getAnimstate()->lastUpdateFrame == memory->globalVars->framecount)
-                        entity->getAnimstate()->lastUpdateFrame -= 1;
-
-                    if (entity->getAnimstate()->lastUpdateTime == memory->globalVars->currenttime)
-                        entity->getAnimstate()->lastUpdateTime += ticksToTime(1);
-
-                    entity->updateClientSideAnimation();
-
-                    // Restore time
-                    memory->globalVars->currenttime = currentTimeBackup;
-                }
-
-                // Final update with actual values
-                entity->getEFlags() &= ~0x1000;
-                entity->getAbsVelocity() = records.velocity;
-                entity->duckAmount() = records.duckAmount;
+                entity->getAbsVelocity() = record.velocity;
+                entity->duckAmount() = record.duckAmount;
+                prepareEntityForUpdate(entity);
                 entity->updateClientSideAnimation();
             }
 
             updatingEntity = false;
 
+            rebuildAnimationState(entity, record);
+
+            // Simulate different sides for resolver
+            const float eyeYaw = entity->eyeAngles().y;
+            const float maxDesync = entity->getMaxDesyncAngle();
+
+            simulateSide(entity, record, eyeYaw, record.centerLayer, record.centerMatrix);
+            simulateSide(entity, record, eyeYaw + maxDesync, record.leftLayer, record.leftMatrix);
+            simulateSide(entity, record, eyeYaw - maxDesync, record.rightLayer, record.rightMatrix);
+
+            // Store resolver layers
+            std::memcpy(record.resolver_layers[0].data(), record.leftLayer.data(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+            std::memcpy(record.resolver_layers[1].data(), record.rightLayer.data(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+            std::memcpy(record.resolver_layers[2].data(), record.centerLayer.data(),
+                sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+
             // Run resolver post-update
-            Resolver::runPostUpdate(records, prev_records, entity);
+            Resolver::update(entity, record);
 
-            // УЛУЧШЕНИЕ: правильный расчет animated speed
-            float max_speed = CS_PLAYER_SPEED_RUN;
-            if (Entity* weapon = entity->getActiveWeapon(); weapon && weapon->getWeaponData())
-                max_speed = std::fmaxf(entity->isScoped() ? weapon->getWeaponData()->maxSpeedAlt : weapon->getWeaponData()->maxSpeed, 0.001f);
+            // Setup final bones
+            record.absAngle = entity->getAbsAngle();
+            record.mins = entity->getCollideable()->obbMins();
+            record.maxs = entity->getCollideable()->obbMaxs();
+            record.moveWeight = entity->getAnimstate() ? entity->getAnimstate()->moveWeight : 0.f;
 
-            if (entity->is_walking())
-                max_speed *= CS_PLAYER_SPEED_WALK_MODIFIER;
+            const auto& resolverData = Resolver::getData(i);
+            float resolvedYaw = entity->getAnimstate() ? entity->getAnimstate()->footYaw : eyeYaw;
 
-            if (entity->duckAmount() >= 1.f)
-                max_speed *= CS_PLAYER_SPEED_DUCK_MODIFIER;
-
-            // Apply animated speed correction
-            if (entity->flags() & FL_ONGROUND)
-            {
-                auto& layer_aliveloop = records.layers[ANIMATION_LAYER_ALIVELOOP];
-                float base_value = 1.f - layer_aliveloop.weight;
-                float fake_speed_portion = base_value / 2.85f;
-
-                if (fake_speed_portion > 0.f)
-                    fake_speed_portion += 0.55f;
-
-                float anim_velocity_length = (std::min)(records.velocity.length(), CS_PLAYER_SPEED_RUN);
-
-                if (fake_speed_portion > 0.f && anim_velocity_length > 0.f)
-                    records.velocity = records.velocity * ((fake_speed_portion * max_speed) / anim_velocity_length);
-            }
+            memory->setAbsAngle(entity, Vector{ 0, resolvedYaw, 0 });
+            record.gotMatrix = entity->setupBones(record.matrix.data(), MAXSTUDIOBONES, 0x7FF00,
+                memory->globalVars->currenttime);
         }
 
-        // Setup bones
-        if (runPostUpdate)
-        {
-            records.simulationTime = entity->simulationTime();
-            records.mins = entity->getCollideable()->obbMins();
-            records.maxs = entity->getCollideable()->obbMaxs();
+        gvBackup.restore();
+        entityBackup.restore(entity);
 
-            // Setup matrices для всех поз
-            std::memcpy(entity->animOverlays(), &records.centerLayer, sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-            entity->updateClientSideAnimation();
-
-            std::memcpy(entity->animOverlays(), &records.leftLayer, sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-            entity->updateClientSideAnimation();
-
-            std::memcpy(entity->animOverlays(), &records.rightLayer, sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-            entity->updateClientSideAnimation();
-
-            records.gotMatrix = entity->setupBones(records.matrix.data(), entity->getBoneCache().size, 0x7FF00, memory->globalVars->currenttime);
-        }
-
-        // Restore everything
-        memory->globalVars->frametime = frameTime;
-        memory->globalVars->currenttime = currentTime;
-        memory->globalVars->realtime = realTime;
-        memory->globalVars->absoluteFrameTime = absoluteFT;
-        memory->globalVars->framecount = frameCount;
-        memory->globalVars->tickCount = tickCount;
-        memory->globalVars->interpolationAmount = interpolationAmount;
-
-        entity->getEffects() = backupEffects;
-        entity->lby() = lowerBodyYawTarget;
-        entity->duckAmount() = duckAmount;
-        entity->flags() = flags;
-
-        std::memcpy(entity->animOverlays(), &layersBackup, sizeof(AnimationLayer) * entity->getAnimationLayersCount());
-
-        // Backtrack records
-        if (config->backtrack.enabled && entity->isOtherEnemy(localPlayer.get()))
-        {
-            if (runPostUpdate)
-            {
-                if (!records.backtrackRecords.empty() && records.backtrackRecords.front().simulationTime == entity->simulationTime())
+        // Handle backtrack records
+        if (config->backtrack.enabled && entity->isOtherEnemy(localPlayer.get())) {
+            if (simTimeUpdated && record.gotMatrix) {
+                if (!record.backtrackRecords.empty() &&
+                    record.backtrackRecords.front().simulationTime == record.simulationTime) {
                     continue;
-
-                Players::Record record{};
-                record.origin = records.origin;
-                record.absAngle = records.absAngle;
-                record.simulationTime = records.simulationTime;
-                record.mins = records.mins;
-                record.maxs = records.maxs;
-                std::copy(records.matrix.begin(), records.matrix.end(), record.matrix);
-
-                for (auto bone : { 8, 4, 3, 7, 6, 5 })
-                {
-                    record.positions.push_back(record.matrix[bone].origin());
                 }
 
-                records.backtrackRecords.push_front(record);
+                Players::Record btRecord{};
+                btRecord.origin = record.origin;
+                btRecord.absAngle = record.absAngle;
+                btRecord.simulationTime = record.simulationTime;
+                btRecord.mins = record.mins;
+                btRecord.maxs = record.maxs;
+                btRecord.side = record.side;
+                btRecord.footYaw = entity->getAnimstate() ? entity->getAnimstate()->footYaw : 0.f;
 
-                while (records.backtrackRecords.size() > 3 &&
-                    records.backtrackRecords.size() > static_cast<size_t>(timeToTicks(timeLimit)))
-                {
-                    records.backtrackRecords.pop_back();
+                std::copy(record.matrix.begin(), record.matrix.end(), btRecord.matrix);
+                std::copy(record.layers.begin(), record.layers.end(), btRecord.layers.begin());
+
+                for (auto bone : { 8, 4, 3, 7, 6, 5 }) {
+                    btRecord.positions.push_back(btRecord.matrix[bone].origin());
+                }
+
+                record.backtrackRecords.push_front(btRecord);
+
+                while (record.backtrackRecords.size() > 3 &&
+                    record.backtrackRecords.size() > static_cast<size_t>(timeToTicks(timeLimit))) {
+                    record.backtrackRecords.pop_back();
                 }
             }
         }
-        else
-        {
-            records.backtrackRecords.clear();
+        else {
+            record.backtrackRecords.clear();
         }
     }
 }
 
-// Остальные функции остаются без изменений но добавлю их для полноты
+// ============================================
+// LOCAL PLAYER UPDATE
+// ============================================
 
-void Animations::update(UserCmd* cmd, bool& _sendPacket) noexcept
-{
+void Animations::update(UserCmd* cmd, bool& _sendPacket) noexcept {
     static float spawnTime = 0.f;
 
     if (!localPlayer || !localPlayer->isAlive())
@@ -511,22 +730,17 @@ void Animations::update(UserCmd* cmd, bool& _sendPacket) noexcept
     if (interfaces->engine->isHLTV())
         return;
 
-    if (spawnTime != localPlayer->spawnTime())
-    {
+    if (spawnTime != localPlayer->spawnTime()) {
         spawnTime = localPlayer->spawnTime();
 
-        for (int i = 0; i < 13; i++)
-        {
+        for (int i = 0; i < ANIMATION_LAYER_COUNT; i++) {
             if (i == ANIMATION_LAYER_FLINCH || i == ANIMATION_LAYER_FLASHED ||
                 i == ANIMATION_LAYER_WHOLE_BODY || i == ANIMATION_LAYER_WEAPON_ACTION ||
                 i == ANIMATION_LAYER_WEAPON_ACTION_RECROUCH)
                 continue;
 
-            auto& animLayers = *localPlayer->getAnimationLayer(i);
-            if (!&animLayers)
-                continue;
-
-            animLayers.reset();
+            auto* layer = localPlayer->getAnimationLayer(i);
+            if (layer) layer->reset();
         }
     }
 
@@ -542,101 +756,34 @@ void Animations::update(UserCmd* cmd, bool& _sendPacket) noexcept
 
     updatingLocal = true;
 
-    if (localPlayer->getAnimstate()->lastUpdateFrame == memory->globalVars->framecount)
-        localPlayer->getAnimstate()->lastUpdateFrame -= 1;
-
-    if (localPlayer->getAnimstate()->lastUpdateTime == memory->globalVars->currenttime)
-        localPlayer->getAnimstate()->lastUpdateTime += ticksToTime(1);
-
-    localPlayer->getEFlags() &= ~0x1000;
+    prepareEntityForUpdate(localPlayer.get());
     localPlayer->getAbsVelocity() = EnginePrediction::getVelocity();
 
     localPlayer->updateState(localPlayer->getAnimstate(), viewangles);
     localPlayer->updateClientSideAnimation();
 
-    // Animation breakers
-    if (config->misc.moonwalk_style == 2)
-    {
-        static auto alpha = 1.0f;
-        static auto switch_alpha = false;
+    std::memcpy(layers.data(), localPlayer->animOverlays(),
+        sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
 
-        if (alpha <= 0.0f || alpha >= 1.0f)
-            switch_alpha = !switch_alpha;
+    if (sendPacket) {
+        applyAnimationBreakers();
 
-        alpha += switch_alpha ? 1.75f * memory->globalVars->frametime : -1.75f * memory->globalVars->frametime;
-        alpha = std::clamp(alpha, 0.0f, 1.0f);
+        std::memcpy(sendPacketLayers.data(), localPlayer->animOverlays(),
+            sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
 
-        if (localPlayer->flags() & FL_ONGROUND)
-        {
-            if (switch_alpha)
-            {
-                localPlayer->setPoseParameter(-1, 0);
-                localPlayer->setPoseParameter(1, 1);
-            }
-            else
-            {
-                localPlayer->setPoseParameter(1, 0);
-                localPlayer->setPoseParameter(-1, 1);
-            }
-        }
-    }
-
-    std::memcpy(&layers, localPlayer->animOverlays(), sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-
-    if (sendPacket)
-    {
-        bool slowwalk = config->misc.slowwalk && config->misc.slowwalkKey.isActive();
-
-        if (config->misc.moonwalk_style == 4)
-            localPlayer->setPoseParameter(0, 7);
-
-        localPlayer->poseParameters().data()[2] = std::rand() % 4 * static_cast<float>(config->condAA.moveBreakers);
-
-        // Animation breakers
-        if ((config->condAA.animBreakers & (1 << 0)))
-            localPlayer->setPoseParameter(1, 6);
-        else
-            localPlayer->setPoseParameter(0, 6);
-
-        if ((config->condAA.animBreakers & (1 << 1)))
-        {
-            static float endTime = memory->globalVars->currenttime;
-            if (localPlayer->getAnimstate()->landing)
-                endTime = memory->globalVars->currenttime + 3.5f;
-            else
-                endTime = memory->globalVars->currenttime;
-
-            if (endTime > memory->globalVars->currenttime)
-                localPlayer->setPoseParameter(2, 12);
-        }
-
-        if ((config->condAA.animBreakers & (1 << 2)))
-        {
-            localPlayer->poseParameters().data()[8] = 0;
-            localPlayer->poseParameters().data()[9] = 0;
-            localPlayer->poseParameters().data()[10] = 0;
-        }
-
-        if ((config->condAA.animBreakers & (1 << 3)) && !slowwalk)
-        {
-            if (localPlayer->velocity().length2D() > 2.5f && !(localPlayer->flags() & FL_ONGROUND))
-                localPlayer->getAnimationLayer(ANIMATION_LAYER_MOVEMENT_MOVE)->weight = 1.f;
-        }
-
-        std::memcpy(&sendPacketLayers, localPlayer->animOverlays(), sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
         footYaw = localPlayer->getAnimstate()->footYaw;
         poseParameters = localPlayer->poseParameters();
 
-        gotMatrixReal = localPlayer->setupBones(realmatrix.data(), localPlayer->getBoneCache().size, 0x7FF00, memory->globalVars->currenttime);
+        gotMatrixReal = localPlayer->setupBones(realmatrix.data(),
+            localPlayer->getBoneCache().size,
+            0x7FF00, memory->globalVars->currenttime);
 
-        if (gotMatrixReal)
-        {
+        if (gotMatrixReal) {
             const auto origin = localPlayer->getRenderOrigin();
-            for (auto& i : realmatrix)
-            {
-                i[0][3] -= origin.x;
-                i[1][3] -= origin.y;
-                i[2][3] -= origin.z;
+            for (auto& mat : realmatrix) {
+                mat[0][3] -= origin.x;
+                mat[1][3] -= origin.y;
+                mat[2][3] -= origin.z;
             }
         }
 
@@ -646,302 +793,194 @@ void Animations::update(UserCmd* cmd, bool& _sendPacket) noexcept
     updatingLocal = false;
 }
 
-void Animations::fake() noexcept
-{
-    static AnimState* fakeAnimState = nullptr;
-    static bool updateFakeAnim = true;
-    static bool initFakeAnim = true;
-    static float spawnTime = 0.f;
+// ============================================
+// FAKE ANIMATION
+// ============================================
 
+void Animations::fake() noexcept {
     if (!localPlayer || !localPlayer->isAlive() || !localPlayer->getAnimstate())
         return;
 
     if (interfaces->engine->isHLTV())
         return;
 
-    if (spawnTime != localPlayer->spawnTime() || updateFakeAnim)
-    {
-        spawnTime = localPlayer->spawnTime();
-        initFakeAnim = false;
-        updateFakeAnim = false;
+    if (fakeSpawnTime != localPlayer->spawnTime()) {
+        fakeSpawnTime = localPlayer->spawnTime();
+        fakeAnimInitialized = false;
     }
 
-    if (!initFakeAnim)
-    {
+    if (!fakeAnimInitialized) {
         fakeAnimState = static_cast<AnimState*>(memory->memalloc->Alloc(sizeof(AnimState)));
-
-        if (fakeAnimState != nullptr)
+        if (fakeAnimState) {
             localPlayer->createState(fakeAnimState);
-
-        initFakeAnim = true;
+        }
+        fakeAnimInitialized = true;
     }
 
     if (!fakeAnimState)
         return;
 
-    if (sendPacket)
-    {
-        updatingFake = true;
+    if (!sendPacket)
+        return;
 
-        std::array<AnimationLayer, 13> layersBackup;
-        std::memcpy(&layersBackup, localPlayer->animOverlays(), sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
+    updatingFake = true;
 
-        const auto backupAbs = localPlayer->getAbsAngle();
-        const auto backupPoses = localPlayer->poseParameters();
+    EntityStateBackup backup;
+    backup.save(localPlayer.get());
 
-        localPlayer->updateState(fakeAnimState, viewangles);
+    localPlayer->updateState(fakeAnimState, viewangles);
 
-        if (fabsf(fakeAnimState->footYaw - footYaw) <= 5.f)
-        {
-            gotMatrix = false;
-            updatingFake = false;
+    const float yawDiff = std::fabsf(fakeAnimState->footYaw - footYaw);
 
-            memory->setAbsAngle(localPlayer.get(), Vector{ 0, fakeAnimState->footYaw, 0 });
-            std::memcpy(localPlayer->animOverlays(), &layersBackup, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-            localPlayer->getAnimationLayer(ANIMATION_LAYER_LEAN)->weight = std::numeric_limits<float>::epsilon();
-
-            gotMatrixFakelag = localPlayer->setupBones(fakelagmatrix.data(), localPlayer->getBoneCache().size, 0x7FF00, memory->globalVars->currenttime);
-
-            std::memcpy(localPlayer->animOverlays(), &layersBackup, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-            localPlayer->poseParameters() = backupPoses;
-            memory->setAbsAngle(localPlayer.get(), Vector{ 0, backupAbs.y, 0 });
-            return;
-        }
+    if (yawDiff <= 5.f) {
+        gotMatrix = false;
 
         memory->setAbsAngle(localPlayer.get(), Vector{ 0, fakeAnimState->footYaw, 0 });
-        std::memcpy(localPlayer->animOverlays(), &layersBackup, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-        localPlayer->getAnimationLayer(ANIMATION_LAYER_LEAN)->weight = std::numeric_limits<float>::epsilon();
+        backup.restore(localPlayer.get());
 
-        gotMatrix = localPlayer->setupBones(fakematrix.data(), localPlayer->getBoneCache().size, 0x7FF00, memory->globalVars->currenttime);
-        gotMatrixFakelag = gotMatrix;
+        auto* leanLayer = localPlayer->getAnimationLayer(ANIMATION_LAYER_LEAN);
+        if (leanLayer) leanLayer->weight = std::numeric_limits<float>::epsilon();
 
-        if (gotMatrix)
-        {
-            std::copy(fakematrix.begin(), fakematrix.end(), fakelagmatrix.data());
-            const auto origin = localPlayer->getRenderOrigin();
-            for (auto& i : fakematrix)
-            {
-                i[0][3] -= origin.x;
-                i[1][3] -= origin.y;
-                i[2][3] -= origin.z;
-            }
-        }
+        gotMatrixFakelag = localPlayer->setupBones(fakelagmatrix.data(),
+            localPlayer->getBoneCache().size,
+            0x7FF00, memory->globalVars->currenttime);
 
-        std::memcpy(localPlayer->animOverlays(), &layersBackup, sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-        localPlayer->poseParameters() = backupPoses;
-        memory->setAbsAngle(localPlayer.get(), Vector{ 0, backupAbs.y, 0 });
-
+        backup.restore(localPlayer.get());
         updatingFake = false;
+        return;
     }
+
+    memory->setAbsAngle(localPlayer.get(), Vector{ 0, fakeAnimState->footYaw, 0 });
+    backup.restore(localPlayer.get());
+
+    auto* leanLayer = localPlayer->getAnimationLayer(ANIMATION_LAYER_LEAN);
+    if (leanLayer) leanLayer->weight = std::numeric_limits<float>::epsilon();
+
+    gotMatrix = localPlayer->setupBones(fakematrix.data(),
+        localPlayer->getBoneCache().size,
+        0x7FF00, memory->globalVars->currenttime);
+    gotMatrixFakelag = gotMatrix;
+
+    if (gotMatrix) {
+        std::copy(fakematrix.begin(), fakematrix.end(), fakelagmatrix.data());
+
+        const auto origin = localPlayer->getRenderOrigin();
+        for (auto& mat : fakematrix) {
+            mat[0][3] -= origin.x;
+            mat[1][3] -= origin.y;
+            mat[2][3] -= origin.z;
+        }
+    }
+
+    backup.restore(localPlayer.get());
+    updatingFake = false;
 }
 
-void Animations::renderStart(FrameStage stage) noexcept
-{
+// ============================================
+// FRAME HANDLERS
+// ============================================
+
+void Animations::renderStart(FrameStage stage) noexcept {
     if (stage != FrameStage::RENDER_START)
         return;
 
-    if (!localPlayer)
+    if (!localPlayer || interfaces->engine->isHLTV())
         return;
 
-    if (interfaces->engine->isHLTV())
-        return;
-
-    for (int i = 0; i < 13; i++)
-    {
+    for (int i = 0; i < ANIMATION_LAYER_COUNT; i++) {
         if (i == ANIMATION_LAYER_FLINCH || i == ANIMATION_LAYER_FLASHED ||
             i == ANIMATION_LAYER_WHOLE_BODY || i == ANIMATION_LAYER_WEAPON_ACTION ||
             i == ANIMATION_LAYER_WEAPON_ACTION_RECROUCH)
             continue;
 
-        auto& animLayers = *localPlayer->getAnimationLayer(i);
-        if (!&animLayers)
-            continue;
-
-        animLayers = layers.at(i);
+        auto* layer = localPlayer->getAnimationLayer(i);
+        if (layer) *layer = layers[i];
     }
 }
 
-void Animations::packetStart() noexcept
-{
-    if (!localPlayer || !localPlayer->animOverlays())
+void Animations::packetStart() noexcept {
+    if (!localPlayer || !localPlayer->animOverlays() || interfaces->engine->isHLTV())
         return;
 
-    if (interfaces->engine->isHLTV())
-        return;
+    std::memcpy(staticLayers.data(), localPlayer->animOverlays(),
+        sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
 
-    std::memcpy(&staticLayers, localPlayer->animOverlays(), sizeof(AnimationLayer) * localPlayer->getAnimationLayersCount());
-
-    if (!localPlayer->getAnimstate())
-        return;
-
-    primaryCycle = localPlayer->getAnimstate()->primaryCycle;
-    moveWeight = localPlayer->getAnimstate()->moveWeight;
+    if (localPlayer->getAnimstate()) {
+        primaryCycle = localPlayer->getAnimstate()->primaryCycle;
+        moveWeight = localPlayer->getAnimstate()->moveWeight;
+    }
 }
 
-static void verifyLayer(int32_t layer) noexcept
-{
-    AnimationLayer currentlayer = *localPlayer->getAnimationLayer(layer);
-    AnimationLayer previousLayer = staticLayers.at(layer);
-
-    auto& l = *localPlayer->getAnimationLayer(layer);
-    if (!&l)
+void Animations::postDataUpdate() noexcept {
+    if (!localPlayer || !localPlayer->animOverlays() || interfaces->engine->isHLTV())
         return;
 
-    if (currentlayer.order != previousLayer.order)
-        l.order = previousLayer.order;
-
-    if (currentlayer.sequence != previousLayer.sequence)
-        l.sequence = previousLayer.sequence;
-
-    if (currentlayer.prevCycle != previousLayer.prevCycle)
-        l.prevCycle = previousLayer.prevCycle;
-
-    if (currentlayer.weight != previousLayer.weight)
-        l.weight = previousLayer.weight;
-
-    if (currentlayer.weightDeltaRate != previousLayer.weightDeltaRate)
-        l.weightDeltaRate = previousLayer.weightDeltaRate;
-
-    if (currentlayer.playbackRate != previousLayer.playbackRate)
-        l.playbackRate = previousLayer.playbackRate;
-
-    if (currentlayer.cycle != previousLayer.cycle)
-        l.cycle = previousLayer.cycle;
-}
-
-void Animations::postDataUpdate() noexcept
-{
-    if (!localPlayer || !localPlayer->animOverlays())
-        return;
-
-    if (interfaces->engine->isHLTV())
-        return;
-
-    for (int i = 0; i < 13; i++)
-    {
+    for (int i = 0; i < ANIMATION_LAYER_COUNT; i++) {
         if (i == ANIMATION_LAYER_FLINCH || i == ANIMATION_LAYER_FLASHED ||
             i == ANIMATION_LAYER_WHOLE_BODY || i == ANIMATION_LAYER_WEAPON_ACTION ||
             i == ANIMATION_LAYER_WEAPON_ACTION_RECROUCH)
             continue;
 
-        verifyLayer(i);
+        auto* layer = localPlayer->getAnimationLayer(i);
+        if (!layer) continue;
+
+        const auto& staticLayer = staticLayers[i];
+
+        if (layer->order != staticLayer.order) layer->order = staticLayer.order;
+        if (layer->sequence != staticLayer.sequence) layer->sequence = staticLayer.sequence;
+        if (layer->prevCycle != staticLayer.prevCycle) layer->prevCycle = staticLayer.prevCycle;
+        if (layer->weight != staticLayer.weight) layer->weight = staticLayer.weight;
+        if (layer->weightDeltaRate != staticLayer.weightDeltaRate)
+            layer->weightDeltaRate = staticLayer.weightDeltaRate;
+        if (layer->playbackRate != staticLayer.playbackRate)
+            layer->playbackRate = staticLayer.playbackRate;
+        if (layer->cycle != staticLayer.cycle) layer->cycle = staticLayer.cycle;
     }
 
-    if (!localPlayer->getAnimstate())
-        return;
-
-    localPlayer->getAnimstate()->primaryCycle = primaryCycle;
-    localPlayer->getAnimstate()->moveWeight = moveWeight;
+    if (localPlayer->getAnimstate()) {
+        localPlayer->getAnimstate()->primaryCycle = primaryCycle;
+        localPlayer->getAnimstate()->moveWeight = moveWeight;
+    }
 }
 
-// Getters остаются без изменений
-void Animations::saveCorrectAngle(int entityIndex, Vector correctAng) noexcept
-{
+// ============================================
+// GETTERS
+// ============================================
+
+void Animations::saveCorrectAngle(int entityIndex, Vector correctAng) noexcept {
     buildTransformsIndex = entityIndex;
     correctAngle = correctAng;
 }
 
-int& Animations::buildTransformationsIndex() noexcept
-{
-    return buildTransformsIndex;
-}
+int& Animations::buildTransformationsIndex() noexcept { return buildTransformsIndex; }
+Vector* Animations::getCorrectAngle() noexcept { return &sentViewangles; }
+Vector* Animations::getViewAngles() noexcept { return &viewangles; }
+Vector* Animations::getLocalAngle() noexcept { return &localAngle; }
 
-Vector* Animations::getCorrectAngle() noexcept
-{
-    return &sentViewangles;
-}
+bool Animations::isLocalUpdating() noexcept { return updatingLocal; }
+bool Animations::isEntityUpdating() noexcept { return updatingEntity; }
+bool Animations::isFakeUpdating() noexcept { return updatingFake; }
 
-Vector* Animations::getViewAngles() noexcept
-{
-    return &viewangles;
-}
+bool Animations::gotFakeMatrix() noexcept { return gotMatrix; }
+std::array<matrix3x4, MAXSTUDIOBONES> Animations::getFakeMatrix() noexcept { return fakematrix; }
 
-Vector* Animations::getLocalAngle() noexcept
-{
-    return &localAngle;
-}
+bool Animations::gotFakelagMatrix() noexcept { return gotMatrixFakelag; }
+std::array<matrix3x4, MAXSTUDIOBONES> Animations::getFakelagMatrix() noexcept { return fakelagmatrix; }
 
-bool Animations::isLocalUpdating() noexcept
-{
-    return updatingLocal;
-}
+bool Animations::gotRealMatrix() noexcept { return gotMatrixReal; }
+std::array<matrix3x4, MAXSTUDIOBONES> Animations::getRealMatrix() noexcept { return realmatrix; }
 
-bool Animations::isEntityUpdating() noexcept
-{
-    return updatingEntity;
-}
-
-bool Animations::isFakeUpdating() noexcept
-{
-    return updatingFake;
-}
-
-bool Animations::gotFakeMatrix() noexcept
-{
-    return gotMatrix;
-}
-
-std::array<matrix3x4, MAXSTUDIOBONES> Animations::getFakeMatrix() noexcept
-{
-    return fakematrix;
-}
-
-bool Animations::gotFakelagMatrix() noexcept
-{
-    return gotMatrixFakelag;
-}
-
-std::array<matrix3x4, MAXSTUDIOBONES> Animations::getFakelagMatrix() noexcept
-{
-    return fakelagmatrix;
-}
-
-bool Animations::gotRealMatrix() noexcept
-{
-    return gotMatrixReal;
-}
-
-std::array<matrix3x4, MAXSTUDIOBONES> Animations::getRealMatrix() noexcept
-{
-    return realmatrix;
-}
-
-float Animations::getFootYaw() noexcept
-{
-    return footYaw;
-}
-
-std::array<float, 24> Animations::getPoseParameters() noexcept
-{
-    return poseParameters;
-}
-
-std::array<AnimationLayer, 13> Animations::getAnimLayers() noexcept
-{
+float Animations::getFootYaw() noexcept { return footYaw; }
+std::array<float, 24> Animations::getPoseParameters() noexcept { return poseParameters; }
+std::array<AnimationLayer, ANIMATION_LAYER_COUNT> Animations::getAnimLayers() noexcept {
     return sendPacketLayers;
 }
 
-Animations::Players Animations::getPlayer(int index) noexcept
-{
-    return players.at(index);
-}
+Animations::Players Animations::getPlayer(int index) noexcept { return players.at(index); }
+Animations::Players* Animations::setPlayer(int index) noexcept { return &players.at(index); }
+std::array<Animations::Players, 65> Animations::getPlayers() noexcept { return players; }
+std::array<Animations::Players, 65>* Animations::setPlayers() noexcept { return &players; }
 
-Animations::Players* Animations::setPlayer(int index) noexcept
-{
-    return &players.at(index);
-}
-
-std::array<Animations::Players, 65> Animations::getPlayers() noexcept
-{
-    return players;
-}
-
-std::array<Animations::Players, 65>* Animations::setPlayers() noexcept
-{
-    return &players;
-}
-
-const std::deque<Animations::Players::Record>* Animations::getBacktrackRecords(int index) noexcept
-{
+const std::deque<Animations::Players::Record>* Animations::getBacktrackRecords(int index) noexcept {
     return &players.at(index).backtrackRecords;
 }

@@ -1,269 +1,1107 @@
-﻿#include "AimbotFunctions.h"
-#include "Animations.h"
-#include "Resolver.h"
-
-#include "../Logger.h"
-
-#include "../SDK/GameEvent.h"
-#include "../Vector2D.hpp"
-#include <DirectXMath.h>
-#include <algorithm>
-#include "../xor.h"
+﻿#include "Resolver.h"
+#include "AimbotFunctions.h"
 #include "Backtrack.h"
+#include "../Logger.h"
+#include "../SDK/GameEvent.h"
 #include "../GameData.h"
-std::deque<Resolver::SnapShot> snapshots;
-static std::array<Animations::Players, 65> players{};
-std::deque<Resolver::Ticks> Resolver::bulletImpacts;
-std::deque<Resolver::Ticks> Resolver::tick;
-std::deque<Resolver::Tick> Resolver::shot[65];
-std::string ResolverMode[65];
-UserCmd* cmd;
-bool resolver = true;
-float desyncAng{ 0 };
+#include "../Helpers.h"
+#include "../Memory.h"
+#include "../Interfaces.h"
+#include "../Config.h"
 
-#define TICK_INTERVAL            ( memory->globalVars->currenttime )
-#define TIME_TO_TICKS( dt )        ( (int)( 0.5f + (float)(dt) / TICK_INTERVAL ) )
-#define TICKS_TO_TIME( t )        ( TICK_INTERVAL *( t ) )
-#define M_RADPI 57.295779513082f
+// ============================================
+// INITIALIZATION
+// ============================================
 
-std::string getStringFromHitbox(int hitgroup) noexcept
-{
-    switch (hitgroup) {
-    case 0:
-    case 1:
-        return "head";
-    case 2:
-    case 3:
-        return "Stomach";
-    case 4:
-    case 5:
-    case 6:
-        return "Chest";
-    case 7:
-        return "Right Leg";
-    case 8:
-        return "Light Leg";
-    case 9:
-        return "Right Leg";
-    case 10:
-        return "Light Leg";
-    case 11:
-        return "Right Foot";
-    case 12:
-        return "Left Foot";
-    case 13:
-        return "Right Hand";
-    case 14:
-        return "Left Hand";
-    case 15:
-        return "Right Hand";
-    case 16:
-        return "Right Hand";
-    case 17:
-        return "Left Hand";
-    case 18:
-        return "Left Hand";
-    default:
-        return "unknown";
+void Resolver::initialize() noexcept {
+    for (auto& d : data) {
+        d.reset();
     }
-}
-
-
-void Resolver::initialize(Entity* e, adjust_data* record, const float& goal_feet_yaw, const float& pitch)
-{
-    player = e;
-    player_record = record;
-
-    original_goal_feet_yaw = Helpers::normalizeYaw(goal_feet_yaw);
-    original_pitch = Helpers::normalize_pitch(pitch);
-}
-
-void Resolver::CmdGrabber(UserCmd* cmd1)
-{
-    cmd = cmd1;
-}
-
-void Resolver::reset()
-{
-    player = nullptr;
-    player_record = nullptr;
-
-    side = false;
-    fake = false;
-
-    was_first_bruteforce = false;
-    was_second_bruteforce = false;
-
-    ResolveSide[64] = 0;
-
-    original_goal_feet_yaw = 0.0f;
-    original_pitch = 0.0f;
-
     snapshots.clear();
 }
 
-void Resolver::saveRecord(int playerIndex, float playerSimulationTime) noexcept
-{
-    const auto entity = interfaces->entityList->getEntity(playerIndex);
-    const auto player = Animations::getPlayer(playerIndex);
-    if (!player.gotMatrix || !entity)
+void Resolver::reset() noexcept {
+    initialize();
+}
+
+
+// ============================================
+// MAIN UPDATE FUNCTION
+// ============================================
+
+void Resolver::update(Entity* entity, Animations::Players& player) noexcept {
+    if (!enabled || !entity || !entity->isAlive())
         return;
 
-    SnapShot snapshot;
-    snapshot.player = player;
-    snapshot.playerIndex = playerIndex;
-    snapshot.eyePosition = localPlayer->getEyePosition();
-    snapshot.model = entity->getModel();
-
-    if (player.simulationTime == playerSimulationTime)
-    {
-        snapshots.push_back(snapshot);
+    if (entity->isDormant() || entity->isBot())
         return;
+
+    if (!localPlayer || entity->team() == localPlayer->team())
+        return;
+
+    const int index = entity->index();
+    if (index < 1 || index > 64)
+        return;
+
+    auto& info = data[index];
+    auto* animState = entity->getAnimstate();
+
+    if (!animState)
+        return;
+
+    // Update mode
+    info.mode = detectMode(entity, info);
+    info.is_on_ground = (entity->flags() & FL_ONGROUND) != 0;
+    info.is_moving = entity->velocity().length2D() > MOVING_SPEED_THRESHOLD;
+
+    // Store eye angles history
+    info.eye_angles_history[info.eye_angles_index % 16] = entity->eyeAngles();
+    info.eye_angles_index++;
+
+    // Update all resolver data
+    updateLBYData(entity, info);
+    updateAnimStateData(entity, info);
+    updatePoseParamData(entity, info);
+
+    // Detect states
+    info.jitter.is_jittering = detectJitter(entity, info);
+    info.is_low_delta = detectLowDelta(entity, info);
+    info.is_faking = detectFakeAngles(entity);
+    info.extended_desync = detectExtendedDesync(entity, info);
+
+    // Collect votes from all methods
+    collectVotes(entity, info);
+
+    // Process votes and determine final angle
+    processVotes(entity, info);
+
+    // Calculate and apply final yaw
+    float finalYaw = calculateFinalYaw(entity, info);
+    animState->footYaw = buildServerAbsYaw(entity, finalYaw);
+
+    // Update player data
+    player.side = static_cast<int>(info.side);
+    info.last_resolve_time = memory->globalVars->currenttime;
+}
+
+// ============================================
+// VOTING SYSTEM
+// ============================================
+
+void Resolver::collectVotes(Entity* entity, ResolverData& info) noexcept {
+    // Clear previous votes
+    for (auto& vote : info.votes) {
+        vote = MethodVote();
     }
 
-    for (int i = 0; i < static_cast<int>(player.backtrackRecords.size()); i++)
-    {
-        if (player.backtrackRecords.at(i).simulationTime == playerSimulationTime)
-        {
-            snapshot.backtrackRecord = i;
-            snapshots.push_back(snapshot);
-            return;
+    // Collect vote from each method
+    info.votes[static_cast<int>(ResolveMethod::LBY)] = resolveLBY(entity, info);
+    info.votes[static_cast<int>(ResolveMethod::ANIMSTATE)] = resolveAnimState(entity, info);
+    info.votes[static_cast<int>(ResolveMethod::POSE_PARAM)] = resolvePoseParams(entity, info);
+    info.votes[static_cast<int>(ResolveMethod::TRACE)] = resolveTrace(entity, info);
+    info.votes[static_cast<int>(ResolveMethod::BRUTEFORCE)] = resolveBruteforce(entity, info);
+}
+
+void Resolver::processVotes(Entity* entity, ResolverData& info) noexcept {
+    // Calculate weighted scores for each side
+    float leftScore = 0.f;
+    float rightScore = 0.f;
+    float centerScore = 0.f;
+
+    float totalWeight = 0.f;
+    float bestConfidence = 0.f;
+    ResolveMethod bestMethod = ResolveMethod::LBY;
+    float bestYaw = entity->eyeAngles().y;
+
+    for (int i = 0; i < static_cast<int>(ResolveMethod::COUNT); i++) {
+        const auto& vote = info.votes[i];
+        if (!vote.valid)
+            continue;
+
+        float weight = getMethodWeight(static_cast<ResolveMethod>(i), info);
+        float weightedConfidence = vote.confidence * weight;
+
+        switch (vote.side) {
+        case ResolveSide::LEFT:
+            leftScore += weightedConfidence;
+            break;
+        case ResolveSide::RIGHT:
+            rightScore += weightedConfidence;
+            break;
+        case ResolveSide::ORIGINAL:
+            centerScore += weightedConfidence;
+            break;
         }
+
+        totalWeight += weight;
+
+        // Track best individual method
+        if (weightedConfidence > bestConfidence) {
+            bestConfidence = weightedConfidence;
+            bestMethod = static_cast<ResolveMethod>(i);
+            bestYaw = vote.suggested_yaw;
+        }
+    }
+
+    // Normalize scores
+    if (totalWeight > 0.f) {
+        leftScore /= totalWeight;
+        rightScore /= totalWeight;
+        centerScore /= totalWeight;
+    }
+
+    // Determine winning side
+    if (leftScore > rightScore && leftScore > centerScore) {
+        info.side = ResolveSide::LEFT;
+        info.confidence = leftScore;
+    }
+    else if (rightScore > leftScore && rightScore > centerScore) {
+        info.side = ResolveSide::RIGHT;
+        info.confidence = rightScore;
+    }
+    else {
+        info.side = ResolveSide::ORIGINAL;
+        info.confidence = centerScore;
+    }
+
+    info.winning_method = bestMethod;
+
+    // Calculate weighted average yaw from all valid votes
+    float totalYaw = 0.f;
+    float yawWeight = 0.f;
+
+    for (int i = 0; i < static_cast<int>(ResolveMethod::COUNT); i++) {
+        const auto& vote = info.votes[i];
+        if (!vote.valid)
+            continue;
+
+        float weight = getMethodWeight(static_cast<ResolveMethod>(i), info) * vote.confidence;
+
+        // Convert yaw to vector for proper averaging
+        float rad = vote.suggested_yaw * (3.14159265f / 180.f);
+        totalYaw += std::atan2(
+            std::sin(rad) * weight,
+            std::cos(rad) * weight
+        );
+        yawWeight += weight;
+    }
+
+    if (yawWeight > 0.f) {
+        info.resolved_yaw = normalizeYaw(totalYaw * (180.f / 3.14159265f));
+    }
+    else {
+        info.resolved_yaw = entity->eyeAngles().y;
     }
 }
 
-Resolver::Ticks Resolver::getClosest(const float time) noexcept
-{
-    //works pretty good right now, no need to change it
-    Resolver::Ticks record{ };
-    record.position = Vector{};
-    record.time = -1.0f;
+float Resolver::calculateFinalYaw(Entity* entity, ResolverData& info) noexcept {
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
 
-    int bestTick = -1;
-    float bestTime = FLT_MAX;
-
-    for (size_t i = 0; i < tick.size(); i++)
-    {
-        if (tick.at(i).time > time)
-            continue;
-
-        float diff = time - tick.at(i).time;
-        if (diff < 0.f)
-            continue;
-
-        if (diff < bestTime)
-        {
-            bestTime = diff;
-            bestTick = i;
-        }
+    // If high confidence, use resolved yaw directly
+    if (info.confidence > 0.7f) {
+        return info.resolved_yaw;
     }
-    if (bestTick == -1)
-        return record;
-    return tick[bestTick];
+
+    // Otherwise, use side-based calculation
+    float desyncAngle = maxDesync;
+
+    if (info.is_low_delta) {
+        desyncAngle *= 0.5f;
+    }
+
+    if (info.extended_desync) {
+        desyncAngle = maxDesync; // Full desync
+    }
+
+    return eyeYaw + desyncAngle * static_cast<float>(info.side);
 }
 
-void Resolver::getEvent(GameEvent* event) noexcept
-{
+float Resolver::getMethodWeight(ResolveMethod method, ResolverData& info) noexcept {
+    // Base weights
+    float weight = 1.f;
+
+    switch (method) {
+    case ResolveMethod::LBY:
+        weight = WEIGHT_LBY;
+        // LBY is more reliable when standing still
+        if (!info.is_moving && info.lby.updated_this_tick)
+            weight *= 1.5f;
+        // Less reliable when jittering
+        if (info.jitter.is_jittering)
+            weight *= 0.6f;
+        break;
+
+    case ResolveMethod::ANIMSTATE:
+        weight = WEIGHT_ANIMSTATE;
+        // AnimState is very reliable when moving
+        if (info.is_moving)
+            weight *= 1.4f;
+        break;
+
+    case ResolveMethod::POSE_PARAM:
+        weight = WEIGHT_POSE;
+        // Pose params are good for detecting extended desync
+        if (info.extended_desync)
+            weight *= 1.3f;
+        break;
+
+    case ResolveMethod::TRACE:
+        weight = WEIGHT_TRACE;
+        // Trace is good for freestanding detection
+        break;
+
+    case ResolveMethod::BRUTEFORCE:
+        weight = WEIGHT_BRUTE;
+        // Bruteforce gets more weight after misses
+        weight += info.misses * 0.15f;
+        break;
+
+    default:
+        break;
+    }
+
+    return weight;
+}
+
+// ============================================
+// LBY RESOLVER
+// ============================================
+
+void Resolver::updateLBYData(Entity* entity, ResolverData& info) noexcept {
+    auto& lby = info.lby;
+
+    lby.last_lby = lby.current_lby;
+    lby.current_lby = entity->lby();
+    lby.lby_delta = angleDiff(lby.current_lby, lby.last_lby);
+
+    // Store LBY history
+    lby.lby_history[lby.history_index % HISTORY_SIZE] = lby.current_lby;
+    lby.history_index++;
+
+    // Detect LBY update
+    lby.updated_this_tick = std::fabsf(lby.lby_delta) > 1.f;
+
+    if (lby.updated_this_tick) {
+        lby.last_update_time = memory->globalVars->currenttime;
+        lby.flick_count++;
+    }
+
+    // Track standing time for LBY prediction
+    if (!info.is_moving && info.is_on_ground) {
+        lby.standing_time += memory->globalVars->intervalPerTick;
+    }
+    else {
+        lby.standing_time = 0.f;
+        lby.last_moving_lby = lby.current_lby;
+        info.last_moving_time = memory->globalVars->currenttime;
+    }
+
+    // Predict next LBY update
+    lby.next_update_time = lby.last_update_time + LBY_UPDATE_TIME;
+
+    // Detect LBY flicking
+    lby.is_flicking = detectLBYFlick(entity, info);
+}
+
+bool Resolver::predictLBYUpdate(Entity* entity, ResolverData& info) noexcept {
+    if (info.is_moving)
+        return false;
+
+    const float currentTime = memory->globalVars->currenttime;
+    const float timeSinceUpdate = currentTime - info.lby.last_update_time;
+
+    // LBY updates every 1.1 seconds when standing still
+    return timeSinceUpdate >= LBY_UPDATE_TIME - memory->globalVars->intervalPerTick;
+}
+
+bool Resolver::detectLBYFlick(Entity* entity, ResolverData& info) noexcept {
+    auto& lby = info.lby;
+
+    // Check for rapid LBY changes (flicking)
+    int flickCount = 0;
+    for (int i = 0; i < 8; i++) {
+        int idx1 = (lby.history_index - i - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+        int idx2 = (lby.history_index - i - 2 + HISTORY_SIZE) % HISTORY_SIZE;
+
+        float delta = std::fabsf(angleDiff(lby.lby_history[idx1], lby.lby_history[idx2]));
+        if (delta > 30.f) {
+            flickCount++;
+        }
+    }
+
+    return flickCount >= 3;
+}
+
+Resolver::ResolveSide Resolver::getLBYSide(Entity* entity, ResolverData& info) noexcept {
+    const float eyeYaw = entity->eyeAngles().y;
+    const float lbyDelta = angleDiff(info.lby.current_lby, eyeYaw);
+
+    if (std::fabsf(lbyDelta) < 10.f)
+        return ResolveSide::ORIGINAL;
+
+    return lbyDelta > 0.f ? ResolveSide::LEFT : ResolveSide::RIGHT;
+}
+
+Resolver::MethodVote Resolver::resolveLBY(Entity* entity, ResolverData& info) noexcept {
+    MethodVote vote;
+    vote.method = ResolveMethod::LBY;
+    vote.valid = true;
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
+
+    // When moving, LBY is reliable
+    if (info.is_moving) {
+        vote.side = ResolveSide::ORIGINAL;
+        vote.suggested_yaw = info.lby.current_lby;
+        vote.confidence = 0.9f;
+        return vote;
+    }
+
+    // Check if LBY just updated
+    if (info.lby.updated_this_tick && !info.lby.is_flicking) {
+        vote.side = getLBYSide(entity, info);
+        vote.suggested_yaw = info.lby.current_lby;
+        vote.confidence = 0.85f;
+        return vote;
+    }
+
+    // Predict LBY update
+    if (predictLBYUpdate(entity, info)) {
+        vote.side = getLBYSide(entity, info);
+        vote.suggested_yaw = eyeYaw + maxDesync * static_cast<float>(vote.side);
+        vote.confidence = 0.7f;
+        return vote;
+    }
+
+    // LBY flicking - less reliable
+    if (info.lby.is_flicking) {
+        vote.side = getLBYSide(entity, info);
+        vote.confidence = 0.4f;
+    }
+    else {
+        // Use last known LBY
+        const float lbyDelta = angleDiff(info.lby.last_moving_lby, eyeYaw);
+        vote.side = lbyDelta > 0.f ? ResolveSide::LEFT : ResolveSide::RIGHT;
+        vote.confidence = 0.5f;
+    }
+
+    vote.suggested_yaw = eyeYaw + maxDesync * static_cast<float>(vote.side);
+    return vote;
+}
+
+// ============================================
+// ANIMSTATE RESOLVER
+// ============================================
+
+void Resolver::updateAnimStateData(Entity* entity, ResolverData& info) noexcept {
+    auto* animState = entity->getAnimstate();
+    if (!animState)
+        return;
+
+    auto& as = info.animstate;
+
+    // Store previous values
+    as.last_foot_yaw = as.foot_yaw;
+    std::memcpy(as.prev_layers.data(), as.layers.data(), sizeof(as.layers));
+
+    // Update current values
+    as.foot_yaw = animState->footYaw;
+    as.goal_feet_yaw = animState->eyeYaw; // Goal feet yaw is based on eye yaw
+    as.eye_yaw = animState->eyeYaw;
+    as.duck_amount = animState->animDuckAmount;
+    as.velocity_length = entity->velocity().length2D();
+
+    // Copy current layers
+    std::memcpy(as.layers.data(), entity->get_animlayers(), sizeof(as.layers));
+
+    // Calculate layer deltas
+    for (int i = 0; i < 13; i++) {
+        as.layer_deltas[i].weight_delta = as.layers[i].weight - as.prev_layers[i].weight;
+        as.layer_deltas[i].cycle_delta = as.layers[i].cycle - as.prev_layers[i].cycle;
+        as.layer_deltas[i].rate_delta = as.layers[i].playbackRate - as.prev_layers[i].playbackRate;
+    }
+
+    // Calculate move yaw
+    as.move_yaw = getMoveYaw(entity, info);
+}
+
+float Resolver::getMoveYaw(Entity* entity, ResolverData& info) noexcept {
+    const Vector velocity = entity->velocity();
+    const float speed = velocity.length2D();
+
+    if (speed < 0.1f)
+        return info.animstate.foot_yaw;
+
+    // Calculate velocity direction
+    float velYaw = std::atan2(velocity.y, velocity.x) * (180.f / 3.14159265f);
+
+    // Move yaw is relative to foot yaw
+    return normalizeYaw(velYaw - info.animstate.foot_yaw);
+}
+
+bool Resolver::detectExtendedDesync(Entity* entity, ResolverData& info) noexcept {
+    // Check animation layer 3 for extended desync detection
+    const auto& layer3 = info.animstate.layers[3];
+
+    if (layer3.cycle == 0.f && layer3.weight == 0.f) {
+        return true; // Extended desync detected
+    }
+
+    return false;
+}
+
+float Resolver::compareAnimLayers(Entity* entity, ResolverData& info) noexcept {
+    // Compare movement layer (layer 6) for side detection
+    const auto& moveLayer = info.animstate.layers[6];
+    const auto& prevMoveLayer = info.animstate.prev_layers[6];
+
+    if (moveLayer.weight < 0.01f)
+        return 0.f;
+
+    // Simulate layers for left and right
+    // This is simplified - in reality you'd need to fully simulate the animstate
+    float leftDelta = std::fabsf(moveLayer.playbackRate - prevMoveLayer.playbackRate);
+    float rightDelta = std::fabsf(moveLayer.playbackRate - prevMoveLayer.playbackRate);
+
+    return leftDelta - rightDelta;
+}
+
+Resolver::ResolveSide Resolver::getAnimStateSide(Entity* entity, ResolverData& info) noexcept {
+    const float eyeYaw = entity->eyeAngles().y;
+    const float footYaw = info.animstate.foot_yaw;
+    const float delta = angleDiff(footYaw, eyeYaw);
+
+    if (std::fabsf(delta) < 10.f)
+        return ResolveSide::ORIGINAL;
+
+    return delta > 0.f ? ResolveSide::RIGHT : ResolveSide::LEFT;
+}
+
+Resolver::MethodVote Resolver::resolveAnimState(Entity* entity, ResolverData& info) noexcept {
+    MethodVote vote;
+    vote.method = ResolveMethod::ANIMSTATE;
+    vote.valid = true;
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
+
+    // Check movement layer for direction
+    const auto& moveLayer = info.animstate.layers[ANIMATION_LAYER_MOVEMENT_MOVE];
+    const auto& prevMoveLayer = info.animstate.prev_layers[ANIMATION_LAYER_MOVEMENT_MOVE];
+
+    if (info.is_moving && moveLayer.weight > 0.1f) {
+        // When moving, compare playback rates
+        float rateDelta = moveLayer.playbackRate - prevMoveLayer.playbackRate;
+
+        if (std::fabsf(rateDelta) > 0.001f) {
+            vote.side = rateDelta > 0.f ? ResolveSide::RIGHT : ResolveSide::LEFT;
+            vote.confidence = (std::min)(std::fabsf(rateDelta) * 10.f, 0.9f);
+        }
+        else {
+            vote.side = getAnimStateSide(entity, info);
+            vote.confidence = 0.6f;
+        }
+    }
+    else {
+        // Standing - use adjust layer (layer 3)
+        const auto& adjustLayer = info.animstate.layers[ANIMATION_LAYER_ADJUST];
+
+        if (adjustLayer.weight > 0.f && adjustLayer.cycle > 0.f) {
+            // Adjusting balance - can determine side from this
+            vote.side = adjustLayer.cycle > 0.5f ? ResolveSide::LEFT : ResolveSide::RIGHT;
+            vote.confidence = 0.7f;
+        }
+        else {
+            vote.side = getAnimStateSide(entity, info);
+            vote.confidence = 0.5f;
+        }
+    }
+
+    vote.suggested_yaw = eyeYaw + maxDesync * static_cast<float>(vote.side);
+    return vote;
+}
+
+// ============================================
+// POSE PARAMETER RESOLVER
+// ============================================
+
+void Resolver::updatePoseParamData(Entity* entity, ResolverData& info) noexcept {
+    auto& pose = info.pose;
+
+    // Store previous values
+    std::memcpy(pose.previous.data(), pose.current.data(), sizeof(pose.current));
+
+    // Get current pose parameters
+    for (int i = 0; i < POSE_PARAM_COUNT && i < 24; i++) {
+        pose.current[i] = entity->poseParameters()[i];
+        pose.deltas[i] = pose.current[i] - pose.previous[i];
+    }
+
+    // Extract key pose parameters
+    pose.body_yaw = pose.current[BODY_YAW];
+    pose.lean_yaw = pose.current[LEAN_YAW];
+    pose.move_yaw = pose.current[MOVE_YAW];
+}
+
+void Resolver::simulatePoseParams(Entity* entity, ResolverData& info, float yaw,
+    std::array<float, POSE_PARAM_COUNT>& out) noexcept {
+    auto* animState = entity->getAnimstate();
+    if (!animState)
+        return;
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
+
+    // Simulate body_yaw pose parameter
+    float bodyYaw = angleDiff(yaw, eyeYaw);
+    bodyYaw = std::clamp(bodyYaw, -maxDesync, maxDesync);
+
+    // Normalize to 0-1 range (pose parameters are normalized)
+    out[BODY_YAW] = (bodyYaw + 60.f) / 120.f;
+
+    // Simulate lean_yaw
+    out[LEAN_YAW] = info.pose.current[LEAN_YAW]; // Keep current lean
+
+    // Simulate move_yaw
+    if (info.is_moving) {
+        const Vector velocity = entity->velocity();
+        float velYaw = std::atan2(velocity.y, velocity.x) * (180.f / 3.14159265f);
+        float moveYaw = angleDiff(velYaw, yaw);
+        out[MOVE_YAW] = (moveYaw + 180.f) / 360.f;
+    }
+    else {
+        out[MOVE_YAW] = 0.5f;
+    }
+}
+
+float Resolver::comparePoseParams(const std::array<float, POSE_PARAM_COUNT>& a,
+    const std::array<float, POSE_PARAM_COUNT>& b) noexcept {
+    float diff = 0.f;
+
+    // Weight important pose parameters more heavily
+    const float weights[POSE_PARAM_COUNT] = {
+        1.5f, // LEAN_YAW
+        0.5f, // SPEED
+        0.0f, // LADDER_SPEED
+        0.0f, // LADDER_YAW
+        1.2f, // MOVE_YAW
+        0.5f, // RUN
+        2.0f, // BODY_YAW (most important)
+        1.0f, // BODY_PITCH
+        0.0f, // DEATH_YAW
+        0.5f, // STAND
+        0.0f, // JUMP_FALL
+        0.3f, // AIM_BLEND_STAND_IDLE
+        0.3f, // AIM_BLEND_CROUCH_IDLE
+        0.8f, // STRAFE_DIR
+    };
+
+    for (int i = 0; i < 14; i++) {
+        diff += std::fabsf(a[i] - b[i]) * weights[i];
+    }
+
+    return diff;
+}
+
+float Resolver::extractBodyYawFromPose(Entity* entity, ResolverData& info) noexcept {
+    // Body yaw pose parameter is normalized 0-1 representing -60 to +60 degrees
+    float bodyYawNorm = info.pose.current[BODY_YAW];
+    float bodyYaw = (bodyYawNorm * 120.f) - 60.f;
+
+    return bodyYaw;
+}
+
+Resolver::ResolveSide Resolver::getPoseParamSide(Entity* entity, ResolverData& info) noexcept {
+    float bodyYaw = extractBodyYawFromPose(entity, info);
+
+    if (std::fabsf(bodyYaw) < 10.f)
+        return ResolveSide::ORIGINAL;
+
+    return bodyYaw > 0.f ? ResolveSide::RIGHT : ResolveSide::LEFT;
+}
+
+Resolver::MethodVote Resolver::resolvePoseParams(Entity* entity, ResolverData& info) noexcept {
+    MethodVote vote;
+    vote.method = ResolveMethod::POSE_PARAM;
+    vote.valid = true;
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
+
+    // Simulate pose parameters for different yaws
+    simulatePoseParams(entity, info, eyeYaw + maxDesync, info.pose.simulated_left);
+    simulatePoseParams(entity, info, eyeYaw - maxDesync, info.pose.simulated_right);
+    simulatePoseParams(entity, info, eyeYaw, info.pose.simulated_center);
+
+    // Compare with actual pose parameters
+    float leftDiff = comparePoseParams(info.pose.current, info.pose.simulated_left);
+    float rightDiff = comparePoseParams(info.pose.current, info.pose.simulated_right);
+    float centerDiff = comparePoseParams(info.pose.current, info.pose.simulated_center);
+
+    // Find best match
+    float minDiff = (std::min)({ leftDiff, rightDiff, centerDiff });
+
+    if (minDiff == leftDiff) {
+        vote.side = ResolveSide::LEFT;
+        vote.suggested_yaw = eyeYaw + maxDesync;
+    }
+    else if (minDiff == rightDiff) {
+        vote.side = ResolveSide::RIGHT;
+        vote.suggested_yaw = eyeYaw - maxDesync;
+    }
+    else {
+        vote.side = ResolveSide::ORIGINAL;
+        vote.suggested_yaw = eyeYaw;
+    }
+
+    // Calculate confidence based on difference magnitude
+    float totalDiff = leftDiff + rightDiff + centerDiff;
+    if (totalDiff > 0.f) {
+        float winnerDiff = minDiff;
+        vote.confidence = 1.f - (winnerDiff / totalDiff);
+    }
+    else {
+        vote.confidence = 0.3f;
+    }
+
+    // Use body_yaw pose parameter as additional validation
+    ResolveSide poseBasedSide = getPoseParamSide(entity, info);
+    if (poseBasedSide == vote.side) {
+        vote.confidence = (std::min)(vote.confidence + 0.15f, 1.f);
+    }
+
+    return vote;
+}
+
+// ============================================
+// TRACE RESOLVER
+// ============================================
+
+Resolver::MethodVote Resolver::resolveTrace(Entity* entity, ResolverData& info) noexcept {
+    MethodVote vote;
+    vote.method = ResolveMethod::TRACE;
+    vote.valid = true;
+
+    if (!localPlayer) {
+        vote.valid = false;
+        return vote;
+    }
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
+    const float atTarget = getAtTargetYaw(entity);
+
+    Vector forward, right, up;
+    Helpers::AngleVectors(Vector(0, atTarget, 0), &forward, &right, &up);
+
+    const Vector src = entity->getEyePosition();
+    const Vector dst = src + forward * 384.f;
+
+    Trace trLeft, trRight, trCenter;
+
+    // Trace left
+    interfaces->engineTrace->traceRay(
+        Ray(src - right * 35.f, dst - right * 35.f),
+        MASK_SHOT, { entity }, trLeft
+    );
+    float leftDist = (trLeft.endpos - trLeft.startpos).length();
+
+    // Trace right
+    interfaces->engineTrace->traceRay(
+        Ray(src + right * 35.f, dst + right * 35.f),
+        MASK_SHOT, { entity }, trRight
+    );
+    float rightDist = (trRight.endpos - trRight.startpos).length();
+
+    // Trace center
+    interfaces->engineTrace->traceRay(
+        Ray(src, dst),
+        MASK_SHOT, { entity }, trCenter
+    );
+    float centerDist = (trCenter.endpos - trCenter.startpos).length();
+
+    // Determine freestanding side
+    float maxDist = (std::max)({leftDist, rightDist, centerDist});
+    float distDiff = std::fabsf(leftDist - rightDist);
+
+    if (distDiff < 20.f) {
+        // No significant difference - can't determine side
+        vote.side = ResolveSide::ORIGINAL;
+        vote.confidence = 0.3f;
+    }
+    else if (leftDist > rightDist) {
+        // Left side is more open - they're likely showing right
+        vote.side = ResolveSide::LEFT;
+        vote.confidence = (std::min)(distDiff / 100.f, 0.8f);
+    }
+    else {
+        vote.side = ResolveSide::RIGHT;
+        vote.confidence = (std::min)(distDiff / 100.f, 0.8f);
+    }
+
+    vote.suggested_yaw = eyeYaw + maxDesync * static_cast<float>(vote.side);
+    return vote;
+}
+
+// ============================================
+// BRUTEFORCE RESOLVER
+// ============================================
+
+Resolver::MethodVote Resolver::resolveBruteforce(Entity* entity, ResolverData& info) noexcept {
+    MethodVote vote;
+    vote.method = ResolveMethod::BRUTEFORCE;
+    vote.valid = true;
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDesync = getMaxDesync(entity);
+    const int misses = info.misses;
+
+    // Bruteforce pattern
+    float bruteYaw = 0.f;
+
+    if (info.jitter.is_jittering) {
+        // For jitter, use different pattern
+        switch (misses % 4) {
+        case 0:
+            bruteYaw = maxDesync;
+            vote.side = ResolveSide::LEFT;
+            break;
+        case 1:
+            bruteYaw = -maxDesync;
+            vote.side = ResolveSide::RIGHT;
+            break;
+        case 2:
+            bruteYaw = maxDesync * 0.5f;
+            vote.side = ResolveSide::LEFT;
+            break;
+        case 3:
+            bruteYaw = -maxDesync * 0.5f;
+            vote.side = ResolveSide::RIGHT;
+            break;
+        }
+    }
+    else {
+        // Standard bruteforce
+        switch (misses % 6) {
+        case 0:
+            bruteYaw = maxDesync * static_cast<float>(info.side);
+            break;
+        case 1:
+            bruteYaw = -maxDesync * static_cast<float>(info.side);
+            vote.side = info.side == ResolveSide::LEFT ? ResolveSide::RIGHT : ResolveSide::LEFT;
+            break;
+        case 2:
+            bruteYaw = 0.f;
+            vote.side = ResolveSide::ORIGINAL;
+            break;
+        case 3:
+            bruteYaw = maxDesync * 0.5f;
+            vote.side = ResolveSide::LEFT;
+            break;
+        case 4:
+            bruteYaw = -maxDesync * 0.5f;
+            vote.side = ResolveSide::RIGHT;
+            break;
+        case 5:
+            bruteYaw = maxDesync * 0.3f;
+            vote.side = ResolveSide::LEFT;
+            break;
+        }
+    }
+
+    vote.suggested_yaw = eyeYaw + bruteYaw;
+    vote.confidence = 0.3f + (misses > 0 ? 0.1f * (std::min)(misses, 5) : 0.f);
+
+    return vote;
+}
+
+// ============================================
+// DETECTION METHODS
+// ============================================
+
+Resolver::ResolveMode Resolver::detectMode(Entity* entity, ResolverData& info) noexcept {
+    if (!entity || !entity->getAnimstate())
+        return ResolveMode::NONE;
+
+    const bool onGround = (entity->flags() & FL_ONGROUND) != 0;
+    const float speed = entity->velocity().length2D();
+
+    if (!onGround)
+        return ResolveMode::AIR;
+
+    // Check for fake walk
+    if (detectFakeWalk(entity, info))
+        return ResolveMode::SLOW_WALK;
+
+    if (speed > MOVING_SPEED_THRESHOLD && speed < FAKE_WALK_THRESHOLD)
+        return ResolveMode::SLOW_WALK;
+
+    if (speed > MOVING_SPEED_THRESHOLD)
+        return ResolveMode::MOVING;
+
+    return ResolveMode::STANDING;
+}
+
+bool Resolver::detectJitter(Entity* entity, ResolverData& info) noexcept {
+    auto& jitter = info.jitter;
+
+    // Store current yaw
+    float currentYaw = entity->eyeAngles().y;
+    jitter.yaw_history[jitter.history_index % HISTORY_SIZE] = currentYaw;
+    jitter.history_index++;
+
+    if (jitter.history_index < 8)
+        return false;
+
+    // Analyze yaw history for jitter patterns
+    jitter.jitter_ticks = 0;
+    jitter.static_ticks = 0;
+    float yawSum = 0.f;
+
+    for (int i = 0; i < 16; i++) {
+        int idx = (jitter.history_index - i - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+        yawSum += jitter.yaw_history[idx];
+
+        if (i > 0) {
+            int prevIdx = (jitter.history_index - i + HISTORY_SIZE) % HISTORY_SIZE;
+            float delta = std::fabsf(angleDiff(
+                jitter.yaw_history[idx],
+                jitter.yaw_history[prevIdx]
+            ));
+
+            if (delta < 2.f)
+                jitter.static_ticks++;
+            else if (delta > JITTER_THRESHOLD)
+                jitter.jitter_ticks++;
+        }
+    }
+
+    jitter.average_yaw = yawSum / 16.f;
+
+    // Calculate variance
+    float variance = 0.f;
+    for (int i = 0; i < 16; i++) {
+        int idx = (jitter.history_index - i - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+        float diff = jitter.yaw_history[idx] - jitter.average_yaw;
+        variance += diff * diff;
+    }
+    jitter.yaw_variance = variance / 16.f;
+
+    // Jitter detection criteria
+    jitter.is_jittering = (jitter.jitter_ticks > jitter.static_ticks) &&
+        (jitter.jitter_ticks >= 4) &&
+        (jitter.yaw_variance > 100.f);
+
+    // Track jitter pattern for prediction
+    if (jitter.is_jittering) {
+        float lastDelta = angleDiff(currentYaw, jitter.yaw_history[
+            (jitter.history_index - 2 + HISTORY_SIZE) % HISTORY_SIZE
+        ]);
+        jitter.jitter_side = lastDelta > 0.f ? 1 : -1;
+    }
+
+    return jitter.is_jittering;
+}
+
+bool Resolver::detectLowDelta(Entity* entity, ResolverData& info) noexcept {
+    auto* animState = entity->getAnimstate();
+    if (!animState)
+        return false;
+
+    const float eyeYaw = entity->eyeAngles().y;
+    const float footYaw = animState->footYaw;
+    const float delta = std::fabsf(angleDiff(eyeYaw, footYaw));
+
+    info.is_low_delta = delta < LOW_DELTA_THRESHOLD;
+    return info.is_low_delta;
+}
+
+bool Resolver::detectFakeAngles(Entity* entity) noexcept {
+    const Vector& eyeAngles = entity->eyeAngles();
+
+    // Check for impossible/extreme pitch
+    if (std::fabsf(eyeAngles.x) > 89.f)
+        return true;
+
+    // Check for very high pitch (likely anti-aim)
+    if (std::fabsf(eyeAngles.x) > 75.f)
+        return true;
+
+    return false;
+}
+
+bool Resolver::detectFakeWalk(Entity* entity, ResolverData& info) noexcept {
+    const float speed = entity->velocity().length2D();
+
+    if (speed < 3.f || speed > FAKE_WALK_THRESHOLD)
+        return false;
+
+    // Check movement layers
+    const auto& moveLayer = info.animstate.layers[ANIMATION_LAYER_MOVEMENT_MOVE];
+
+    // Fake walk: moving but movement layer weight is inconsistent with speed
+    if (moveLayer.weight > 0.1f && moveLayer.playbackRate < 0.4f) {
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================
+// UTILITY METHODS
+// ============================================
+
+float Resolver::getMaxDesync(Entity* entity) noexcept {
+    auto* animState = entity->getAnimstate();
+    if (!animState)
+        return 58.f;
+
+    float duckAmount = animState->animDuckAmount;
+    float speedFraction = std::clamp(animState->speedAsPortionOfWalkTopSpeed, 0.f, 1.f);
+    float speedFactor = std::clamp(animState->speedAsPortionOfCrouchTopSpeed, 0.f, 1.f);
+
+    float modifier = ((animState->walkToRunTransition * -0.3f) - 0.2f) * speedFraction + 1.f;
+
+    if (duckAmount > 0.f) {
+        modifier += (duckAmount * speedFactor) * (0.5f - modifier);
+    }
+
+    return 58.f * modifier;
+}
+
+float Resolver::buildServerAbsYaw(Entity* entity, float yaw) noexcept {
+    const float eyeYaw = entity->eyeAngles().y;
+    const float maxDelta = getMaxDesync(entity);
+
+    float goalFeetYaw = normalizeYaw(yaw);
+    float eyeFeetDelta = angleDiff(eyeYaw, goalFeetYaw);
+
+    if (eyeFeetDelta > maxDelta)
+        goalFeetYaw = eyeYaw - maxDelta;
+    else if (eyeFeetDelta < -maxDelta)
+        goalFeetYaw = eyeYaw + maxDelta;
+
+    return normalizeYaw(goalFeetYaw);
+}
+
+float Resolver::getAtTargetYaw(Entity* entity) noexcept {
+    if (!localPlayer)
+        return 0.f;
+
+    return Helpers::calculate_angle(
+        localPlayer->getAbsOrigin(),
+        entity->getAbsOrigin()
+    ).y;
+}
+
+float Resolver::normalizeYaw(float yaw) noexcept {
+    while (yaw > 180.f) yaw -= 360.f;
+    while (yaw < -180.f) yaw += 360.f;
+    return yaw;
+}
+
+float Resolver::angleDiff(float a, float b) noexcept {
+    float diff = normalizeYaw(a - b);
+    return diff;
+}
+
+float Resolver::approachAngle(float target, float value, float speed) noexcept {
+    float delta = angleDiff(target, value);
+
+    if (delta > speed)
+        return value + speed;
+    else if (delta < -speed)
+        return value - speed;
+
+    return target;
+}
+
+// ============================================
+// DEBUG INFO
+// ============================================
+
+std::string Resolver::getMethodName(ResolveMethod method) noexcept {
+    switch (method) {
+    case ResolveMethod::LBY: return "LBY";
+    case ResolveMethod::ANIMSTATE: return "AnimState";
+    case ResolveMethod::POSE_PARAM: return "PoseParam";
+    case ResolveMethod::TRACE: return "Trace";
+    case ResolveMethod::BRUTEFORCE: return "Bruteforce";
+    default: return "Unknown";
+    }
+}
+
+std::string Resolver::getDebugInfo(int index) noexcept {
+    if (index < 1 || index > 64)
+        return "";
+
+    const auto& info = data[index];
+    std::string result;
+
+    result += "Mode: ";
+    switch (info.mode) {
+    case ResolveMode::STANDING: result += "Standing"; break;
+    case ResolveMode::MOVING: result += "Moving"; break;
+    case ResolveMode::AIR: result += "Air"; break;
+    case ResolveMode::SLOW_WALK: result += "SlowWalk"; break;
+    default: result += "None"; break;
+    }
+
+    result += " | Side: ";
+    switch (info.side) {
+    case ResolveSide::LEFT: result += "Left"; break;
+    case ResolveSide::RIGHT: result += "Right"; break;
+    default: result += "Original"; break;
+    }
+
+    result += " | Conf: " + std::to_string(static_cast<int>(info.confidence * 100)) + "%";
+    result += " | Winner: " + getMethodName(info.winning_method);
+    result += " | Jitter: " + std::string(info.jitter.is_jittering ? "Yes" : "No");
+    result += " | LowD: " + std::string(info.is_low_delta ? "Yes" : "No");
+    result += " | Miss: " + std::to_string(info.misses);
+
+    return result;
+}
+
+// ============================================
+// EVENT HANDLING
+// ============================================
+
+void Resolver::processEvents(GameEvent* event) noexcept {
     if (!event || !localPlayer || interfaces->engine->isHLTV())
         return;
 
     switch (fnv::hashRuntime(event->getName())) {
-    case fnv::hash("round_start"):
-    {
-        //Reset all
-        auto players = Animations::setPlayers();
-        if (players->empty())
-            break;
-
-        for (int i = 0; i < static_cast<int>(players->size()); i++)
-        {
-            players->at(i).misses = 0;
+    case fnv::hash("round_start"): {
+        for (auto& d : data) {
+            d.misses = 0;
+            d.hits = 0;
         }
         snapshots.clear();
         break;
     }
-    case fnv::hash("weapon_fire"):
-    {
-        if (snapshots.empty())
-            break;
-
-        const auto playerId = event->getInt("userid");
-        if (playerId == localPlayer->getUserId())
-            break;
-
-        const auto index = interfaces->engine->getPlayerFromUserID(playerId);
-        Animations::setPlayer(index)->shot = true;
-
-        auto& snapshot = snapshots.front();
-
-        if (!snapshot.gotImpact)
-            snapshot.time = memory->globalVars->serverTime();
-
-        break;
-    }
-    case fnv::hash("player_death"):
-    {
-        //Reset player
-        if (snapshots.empty())
-            break;
-
-        //Reset player
-        const auto playerId = event->getInt("userid");
-        if (playerId == localPlayer->getUserId())
-            break;
-
-        const auto index = interfaces->engine->getPlayerFromUserID(playerId);
-        Animations::setPlayer(index)->misses = 0;
-        break;
-    }
-    case fnv::hash("player_hurt"):
-    {
+    case fnv::hash("player_hurt"): {
         if (snapshots.empty())
             break;
 
         if (event->getInt("attacker") != localPlayer->getUserId())
             break;
 
-        if (!localPlayer->isAlive())
-            break;
-
-        const auto hitgroup = event->getInt("hitgroup");
-        if (hitgroup < HitGroup::Head || hitgroup > HitGroup::RightLeg)
-            break;
-
-        // Get the player entity
         const auto playerId = event->getInt("userid");
         const auto index = interfaces->engine->getPlayerFromUserID(playerId);
-        const auto entity = interfaces->entityList->getEntity(index);
-        if (!entity)
-            break;
 
-        // Log the side hit when a player is hurt
-        const auto& info = resolver_info[index];
-        std::string sideHit = info.side == 1 ? "right" : info.side == -1 ? "left" : "middle"; // 1 = right, -1 = left, 0 = middle
-        std::string jittering = info.is_jittering ? "true" : "false"; // check if they were jittering
-        std::string safety = info.is_jittering ? "kinda" : GetLowDeltaState(entity) ? "not really" : "yes";
-        std::string playerName = entity->getPlayerName(); // Get player name
-        std::string footyaw = std::to_string(entity->getAnimstate()->footYaw);
-        std::string v39 = GetLowDeltaState(entity) ? "true" : "false"; // reversed
-        std::string v40 = std::to_string(snapshots.front().backtrackRecord); // reversed | might be incorrect
+        if (index > 0 && index < 65) {
+            data[index].hits++;
+            data[index].total_shots++;
+        }
 
-
-        ++hits;
-        hit_rate = misses != 0 ? (hits / (hits + misses)) * 100 : 100;
-        snapshots.pop_front(); // Hit somebody so don't calculate       
-
-        if ((config->misc.loggerOptions.events & 1 << Logger::DamageDealt) != 1 << Logger::DamageDealt)
-            break;
-
-        if (std::abs(entity->getAnimstate()->footYaw) <= 50)
-            Logger::addLog("hit player | " + playerName + " | AnimLayers | Side: " + sideHit + " | body_yaw: " + footyaw + "°" + " | History: " + v40 + "t | Delta: " + v39 + " | Jitter: " + jittering + " | Safe : " + safety);
-        else
-            Logger::addLog("hit player | " + playerName + " | Correction | Angle: " + footyaw + "°" + " | History: " + v40 + "t | Safe: " + safety);
+        if (!snapshots.empty())
+            snapshots.pop_front();
         break;
     }
-    case fnv::hash("bullet_impact"):
-    {
+    case fnv::hash("bullet_impact"): {
         if (snapshots.empty())
             break;
 
@@ -271,1832 +1109,158 @@ void Resolver::getEvent(GameEvent* event) noexcept
             break;
 
         auto& snapshot = snapshots.front();
-
-        if (!snapshot.gotImpact)
-        {
+        if (!snapshot.got_impact) {
             snapshot.time = memory->globalVars->serverTime();
-            snapshot.bulletImpact = Vector{ event->getFloat("x"), event->getFloat("y"), event->getFloat("z") };
-            snapshot.gotImpact = true;
-        }
-
-        if (snapshot.player.shot)
-        {
-            Antionetap(event->getInt("userid"), interfaces->entityList->getEntity(snapshot.playerIndex), Vector{ event->getFloat("x"), event->getFloat("y"), event->getFloat("z") });
+            snapshot.impact_position = Vector{
+                event->getFloat("x"),
+                event->getFloat("y"),
+                event->getFloat("z")
+            };
+            snapshot.got_impact = true;
         }
         break;
     }
-    default:
+    case fnv::hash("weapon_fire"): {
+        const auto playerId = event->getInt("userid");
+        if (playerId == localPlayer->getUserId())
+            break;
+
+        const auto index = interfaces->engine->getPlayerFromUserID(playerId);
+        if (index > 0 && index < 65) {
+            Animations::setPlayer(index)->shot = true;
+        }
         break;
     }
-    if (!resolver)
-        snapshots.clear();
-}
-
-Vector calcAngle(Vector source, Vector entityPos) {
-    Vector delta = {};
-    delta.x = source.x - entityPos.x;
-    delta.y = source.y - entityPos.y;
-    delta.z = source.z - entityPos.z;
-    Vector angles = {};
-    Vector viewangles = cmd->viewangles;
-    angles.x = Helpers::rad2deg(atan(delta.z / hypot(delta.x, delta.y))) - viewangles.x;
-    angles.y = Helpers::rad2deg(atan(delta.y / delta.x)) - viewangles.y;
-    angles.z = 0;
-    if (delta.x >= 0.f)
-        angles.y += 180;
-
-    return angles;
-}
-
-float get_backward_side(Entity* entity) {
-    if (!entity->isAlive())
-        return -1.f;
-    const float result = Helpers::angleDiff(localPlayer->origin().y, entity->origin().y);
-    return result;
-}
-float get_angle(Entity* entity) {
-    return Helpers::angleNormalize(entity->eyeAngles().y);
-}
-float get_forward_yaw(Entity* entity) {
-    return Helpers::angleNormalize(get_backward_side(entity) - 180.f);
-}
-float get_foword_yaw(Entity* entity) {
-    return Helpers::angleNormalize(get_backward_side(entity) - 180.f);
-}
-float Resolver::GetLeftYaw(Entity* entity) {
-    return Helpers::normalizeYaw(calcAngle(localPlayer->origin(), entity->origin()).y - 90.f);
-}
-
-float Resolver::GetRightYaw(Entity* entity) {
-    return Helpers::normalizeYaw(calcAngle(localPlayer->origin(), entity->origin()).y + 90.f);
-}
-
-float build_server_abs_yaw(Entity* entity, const float angle)
-{
-    Vector velocity = entity->velocity();
-    const auto& anim_state = entity->getAnimstate();
-    const float m_fl_eye_yaw = angle;
-    float m_fl_goal_feet_yaw = 0.f;
-
-    const float eye_feet_delta = Helpers::angleDiff(m_fl_eye_yaw, m_fl_goal_feet_yaw);
-
-    static auto get_smoothed_velocity = [](const float min_delta, const Vector a, const Vector b) {
-        const Vector delta = a - b;
-        const float delta_length = delta.length();
-
-        if (delta_length <= min_delta)
-        {
-            if (-min_delta <= delta_length)
-                return a;
-            const float i_radius = 1.0f / (delta_length + FLT_EPSILON);
-            return b - delta * i_radius * min_delta;
-        }
-        const float i_radius = 1.0f / (delta_length + FLT_EPSILON);
-        return b + delta * i_radius * min_delta;
-        };
-
-    if (const float spd = velocity.squareLength(); spd > std::powf(1.2f * 260.0f, 2.f))
-    {
-        const Vector velocity_normalized = velocity.normalized();
-        velocity = velocity_normalized * (1.2f * 260.0f);
     }
-
-    const float m_fl_choked_time = anim_state->lastUpdateTime;
-    const float duck_additional = std::clamp(entity->duckAmount() + anim_state->duckAdditional, 0.0f, 1.0f);
-    const float duck_amount = anim_state->animDuckAmount;
-    const float choked_time = m_fl_choked_time * 6.0f;
-    float v28;
-
-    // clamp
-    if (duck_additional - duck_amount <= choked_time)
-        if (duck_additional - duck_amount >= -choked_time)
-            v28 = duck_additional;
-        else
-            v28 = duck_amount - choked_time;
-    else
-        v28 = duck_amount + choked_time;
-
-    const float fl_duck_amount = std::clamp(v28, 0.0f, 1.0f);
-
-    const Vector animation_velocity = get_smoothed_velocity(m_fl_choked_time * 2000.0f, velocity, entity->velocity());
-    const float speed = std::fminf(animation_velocity.length(), 260.0f);
-
-    float fl_max_movement_speed = 260.0f;
-
-    if (Entity* p_weapon = entity->getActiveWeapon(); p_weapon && p_weapon->getWeaponData())
-        fl_max_movement_speed = std::fmaxf(p_weapon->getWeaponData()->maxSpeed, 0.001f);
-
-    float fl_running_speed = speed / (fl_max_movement_speed * 0.520f);
-    float fl_ducking_speed = speed / (fl_max_movement_speed * 0.340f);
-    fl_running_speed = std::clamp(fl_running_speed, 0.0f, 1.0f);
-
-    float fl_yaw_modifier = (anim_state->walkToRunTransition * -0.3f - 0.2f) * fl_running_speed + 1.0f;
-
-    if (fl_duck_amount > 0.0f)
-    {
-        float fl_ducking_speed2 = std::clamp(fl_ducking_speed, 0.0f, 1.0f);
-        fl_yaw_modifier += (fl_ducking_speed2 * fl_duck_amount) * (0.5f - fl_yaw_modifier);
-    }
-
-    constexpr float v60 = -58.f;
-    constexpr float v61 = 58.f;
-
-    const float fl_min_yaw_modifier = v60 * fl_yaw_modifier;
-
-    if (const float fl_max_yaw_modifier = v61 * fl_yaw_modifier; eye_feet_delta <= fl_max_yaw_modifier)
-    {
-        if (fl_min_yaw_modifier > eye_feet_delta)
-            m_fl_goal_feet_yaw = fabs(fl_min_yaw_modifier) + m_fl_eye_yaw;
-    }
-    else
-    {
-        m_fl_goal_feet_yaw = m_fl_eye_yaw - fabs(fl_max_yaw_modifier);
-    }
-
-    Helpers::normalizeYaw(m_fl_goal_feet_yaw);
-
-    if (speed > 0.1f || fabs(velocity.z) > 100.0f)
-    {
-        m_fl_goal_feet_yaw = Helpers::approachAngle(
-            m_fl_eye_yaw,
-            m_fl_goal_feet_yaw,
-            (anim_state->walkToRunTransition * 20.0f + 30.0f)
-            * m_fl_choked_time);
-    }
-    else
-    {
-        m_fl_goal_feet_yaw = Helpers::approachAngle(
-            entity->lby(),
-            m_fl_goal_feet_yaw,
-            m_fl_choked_time * 100.0f);
-    }
-
-    return m_fl_goal_feet_yaw;
 }
 
-void Resolver::apply_side(Entity* entity, const int& choke)
-{
-    auto& info = resolver_info[player->index()];
-    if (!entity->isAlive() || !info.resolved || info.side == side_original)
+void Resolver::saveShot(int playerIndex, float simTime, int backtrackTick) noexcept {
+    if (!localPlayer || playerIndex < 1 || playerIndex > 64)
         return;
 
-    auto state = player->getAnimstate();
-    if (!state)
+    const auto entity = interfaces->entityList->getEntity(playerIndex);
+    const auto& player = Animations::getPlayer(playerIndex);
+
+    if (!entity || !player.gotMatrix)
         return;
 
-    float desync_angle = choke > 3 ? 120.f : entity->getMaxDesyncAngle();
-    state->footYaw = Helpers::normalizeYaw(player->eyeAngles().y + desync_angle * info.side);
+    ShotSnapshot snapshot;
+    snapshot.player_index = playerIndex;
+    snapshot.backtrack_tick = backtrackTick;
+    snapshot.eye_position = localPlayer->getEyePosition();
+    snapshot.model = entity->getModel();
+    snapshot.time = -1.f;
+    snapshot.got_impact = false;
+    snapshot.resolver_state = data[playerIndex];
+
+    std::memcpy(snapshot.matrix, player.matrix.data(), sizeof(snapshot.matrix));
+
+    snapshots.push_back(std::move(snapshot));
+
+    while (snapshots.size() > MAX_SNAPSHOTS)
+        snapshots.pop_front();
+
+    data[playerIndex].total_shots++;
 }
 
-void Resolver::Antionetap(int userid, Entity* entity, Vector shot)
-{
-    std::vector<std::reference_wrapper<const PlayerData>> players_ordered{ GameData::players().begin(), GameData::players().end() };
-    const auto sorter{
-        [](const PlayerData& a, const PlayerData& b)
-        {
-            // enemies first
-            if (a.enemy != b.enemy)
-                return a.enemy && !b.enemy;
-
-            return a.handle < b.handle;
-        }
-    };
-    std::ranges::sort(players_ordered, sorter);
-    for (const std::reference_wrapper<const PlayerData>& player : players_ordered) {
-        if (player.get().userId == userid && entity->isAlive())
-        {
-            const Vector pos = shot;
-            const Vector eye_pos = entity->getEyePosition();
-            const auto [x, y, z] = calcAngle(eye_pos, pos);
-            const auto [lx, ly, lz] = calcAngle(eye_pos, localPlayer->getEyePosition());
-            const Vector delta = { lx - x, ly - y, 0 };
-            if (const float fov = sqrt(delta.x * delta.x + delta.y * delta.y); fov < 20.f)
-            {
-                Logger::addLog("Resolver: " + player.get().name + " missed");
-            }
-        }
-    }
-}
-
-void Resolver::detect_side(Entity* entity, int* side) {
-    /* externals */
-    Vector forward{};
-    Vector right{};
-    Vector up{};
-    Trace tr;
-    Helpers::AngleVectors(Vector(0, get_backward_side(entity), 0), &forward, &right, &up);
-    /* filtering */
-
-    const Vector src_3d = entity->getEyePosition();
-    const Vector dst_3d = src_3d + forward * 384;
-
-    /* back engine tracers */
-    interfaces->engineTrace->traceRay({ src_3d, dst_3d }, MASK_SHOT, { entity }, tr);
-    float back_two = (tr.endpos - tr.startpos).length();
-
-    /* right engine tracers */
-    interfaces->engineTrace->traceRay(Ray(src_3d + right * 35, dst_3d + right * 35), MASK_SHOT, { entity }, tr);
-    float right_two = (tr.endpos - tr.startpos).length();
-
-    /* left engine tracers */
-    interfaces->engineTrace->traceRay(Ray(src_3d - right * 35, dst_3d - right * 35), MASK_SHOT, { entity }, tr);
-    float left_two = (tr.endpos - tr.startpos).length();
-
-    /* fix side */
-    if (left_two > right_two) {
-        *side = -1;
-        //Body should be right
-    }
-    else if (right_two > left_two) {
-        *side = 1;
-    }
-    else
-        delta_side_detect(side, entity);
-}
-
-void Resolver::delta_side_detect(int* side, Entity* entity)
-{
-    float EyeDelta = Helpers::normalizeYaw(entity->eyeAngles().y);
-
-    if (fabs(EyeDelta) > 5)
-    {
-        if (EyeDelta > 5)
-            *side = -1;
-        else if (EyeDelta < -5)
-            *side = 1;
-    }
-    else
-        *side = 0;
-}
-
-bool DesyncDetect(Entity* entity)
-{
-    if (!localPlayer)
-        return false;
-    if (!entity || !entity->isAlive())
-        return false;
-    if (entity->isBot())
-        return false;
-    if (entity->team() == localPlayer->team())
-        return false;
-    if (entity->moveType() == MoveType::NOCLIP || entity->moveType() == MoveType::LADDER)
-        return false;
-    return true;
-}
-
-bool isSlowWalking(Entity* entity)
-{
-    float velocity_2D[64]{}, old_velocity_2D[64]{};
-    if (entity->velocity().length2D() != velocity_2D[entity->index()] && entity->velocity().length2D() != NULL) {
-        old_velocity_2D[entity->index()] = velocity_2D[entity->index()];
-        velocity_2D[entity->index()] = entity->velocity().length2D();
-    }
-    Vector velocity = entity->velocity();
-    Vector direction = entity->eyeAngles();
-
-    float speed = velocity.length();
-    direction.y = entity->eyeAngles().y - direction.y;
-    //method 1
-    if (velocity_2D[entity->index()] > 1) {
-        int tick_counter[64]{};
-        if (velocity_2D[entity->index()] == old_velocity_2D[entity->index()])
-            tick_counter[entity->index()] += 1;
-        else
-            tick_counter[entity->index()] = 0;
-
-        while (tick_counter[entity->index()] > (1 / memory->globalVars->intervalPerTick * fabsf(0.1f)))//should give use 100ms in ticks if their speed stays the same for that long they are definetely up to something..
-            return true;
-    }
-
-    return false;
-}
-
-int GetChokedPackets(Entity* entity) {
-    int last_ticks[65]{};
-    auto ticks = timeToTicks(entity->simulationTime() - entity->oldSimulationTime());
-    if (ticks == 0 && last_ticks[entity->index()] > 0) {
-        return last_ticks[entity->index()] - 1;
-    }
-    else {
-        last_ticks[entity->index()] = ticks;
-        return ticks;
-    }
-}
-
-bool didShoot(UserCmd* cmd) noexcept
-{
-    if (!(cmd->buttons & (UserCmd::IN_ATTACK)))
-        return false;
-
-    if (!localPlayer || localPlayer->nextAttack() > memory->globalVars->serverTime() || localPlayer->isDefusing() || localPlayer->waitForNoAttack())
-        return false;
-
-    const auto activeWeapon = localPlayer->getActiveWeapon();
-    if (!activeWeapon || !activeWeapon->clip())
-        return false;
-
-    if (activeWeapon->nextPrimaryAttack() > memory->globalVars->serverTime())
-        return false;
-
-    if (localPlayer->shotsFired() > 0 && !activeWeapon->isFullAuto())
-        return false;
-
-    Resolver::reset();
-
-    return true;
-}
-
-bool freestand_target(Entity* target, float* yaw)
-{
-    float dmg_left = 0.f;
-    float dmg_right = 0.f;
-
-    static auto get_rotated_pos = [](Vector start, float rotation, float distance)
-        {
-            float rad = DEG2RAD(rotation);
-            start.x += cos(rad) * distance;
-            start.y += sin(rad) * distance;
-
-            return start;
-        };
-
-    if (!localPlayer || !target || !localPlayer->isAlive())
-        return false;
-
-    Vector local_eye_pos = target->getEyePosition();
-    Vector eye_pos = localPlayer->getEyePosition();
-    Vector angle = (local_eye_pos, eye_pos);
-
-    auto backwards = target->eyeAngles().y; // angle.y;
-
-    Vector pos_left = get_rotated_pos(eye_pos, angle.y + 90.f, 60.f);
-    Vector pos_right = get_rotated_pos(eye_pos, angle.y - 90.f, -60.f);
-
-    const auto wall_left = (local_eye_pos, pos_left,
-        nullptr, nullptr, localPlayer);
-
-    const auto wall_right = (local_eye_pos, pos_right,
-        nullptr, nullptr, localPlayer);
-
-    if (dmg_left == 0.f && dmg_right == 0.f)
-    {
-        *yaw = backwards;
-        return false;
-    }
-
-    // we can hit both sides, lets force backwards
-    if (fabsf(dmg_left - dmg_right) < 5.f)
-    {
-        *yaw = backwards;
-        return false;
-    }
-
-    bool direction = dmg_left > dmg_right;
-    *yaw = direction ? angle.y - 90.f : angle.y + 90.f;
-
-    return true;
-}
-
-float Resolver::max_desync_delta(Entity* player)
-{
-    auto animstate = player->getAnimstate();
-
-    float duckammount = *(float*)(animstate + 0xA4);
-    float speedfraction = std::fmax(0, std::fmin(*reinterpret_cast<float*>(animstate + 0xF8), 1));
-
-    float speedfactor = std::fmax(0, std::fmin(1, *reinterpret_cast<float*> (animstate + 0xFC)));
-
-    float unk1 = ((*reinterpret_cast<float*> (animstate + 0x11C) * -0.30000001) - 0.19999999) * speedfraction;
-    float unk2 = unk1 + 1.1f;
-    float unk3;
-
-    if (duckammount > 0) {
-
-        unk2 += ((duckammount * speedfactor) * (0.5 - unk2));
-
-    }
-    else
-        unk2 += ((duckammount * speedfactor) * (0.5 - 0.58));
-
-    unk3 = *(float*)(animstate + 0x334) * unk2;
-    return unk3;
-}
-
-static auto resolve_update_animations(Entity* entity)
-{
-    Resolver::updating_animation = true;
-    entity->updateClientSideAnimation();
-    Resolver::updating_animation = false;
-};
-bool Resolver::DoesHaveJitter(Entity* player) {
-
-    if (!player->isAlive())
-        return false;
-
-    if (!player->isDormant())
-        return false;
-
-    resolve_update_animations(player);
-
-    static float LastAngle[64];
-    static int LastBrute[64];
-    static bool Switch[64];
-    static float LastUpdateTime[64];
-
-    int i = player->index();
-
-    auto simulationtime = player->simulationTime();
-    auto OLDsimulationtime = player->simulationTime() + 4;
-
-    float CurrentAngle = player->eyeAngles().y;
-    if (!Helpers::IsNearEqual(CurrentAngle, LastAngle[i], (max_desync_delta(player) - 4.f))) {
-        Switch[i] = !Switch[i];
-        LastAngle[i] = CurrentAngle;
-        jitter_side = Switch[i] ? 1 : -1;
-        LastBrute[i] = jitter_side;
-        LastUpdateTime[i] = memory->globalVars->currenttime;
-        return true;
-    }
-    else {
-        if (fabsf(LastUpdateTime[i] - memory->globalVars->currenttime >= TICKS_TO_TIME(15))
-            || simulationtime != OLDsimulationtime) {
-            LastAngle[i] = CurrentAngle;
-        }
-        jitter_side = LastBrute[i];
-    }
-    return false;
-}
-
-float resolve_move_yaw(Animations::Players player, Entity* entity)
-{
-    float footYaw = Animations::getFootYaw();
-
-    if (const auto eye_diff = Helpers::angleNormalize(Helpers::angleDiff(entity->eyeAngles().y, footYaw)); eye_diff > entity->getMaxDesyncAngle())
-        player.rotation_side = ROTATION_SIDE_RIGHT;
-    else if (entity->getMaxDesyncAngle() > eye_diff)
-        player.rotation_side = ROTATION_SIDE_LEFT;
-    else
-        player.rotation_side = ROTATION_SIDE_CENTER;
-
-    footYaw = Helpers::approachAngle(entity->eyeAngles().y, footYaw, (entity->getAnimstate()->walkToRunTransition * 20.0f + 30.0f) * entity->getAnimstate()->lastUpdateIncrement);
-
-    player.rotation_side = player.last_side;
-    return footYaw;
-}
-
-float build_move_yaw(Entity* entity)
-{
-    /* m_PlayerAnimationStateCSGO( )->m_flMoveYawIdeal */
-    float moveYawIdeal = Animations::getFootYaw();
-
-    /* Rebuild m_flMoveYawIdeal */
-    float velocityLengthXY = entity->velocity().length2D();
-    if (velocityLengthXY > 0 && entity->flags() & FL_ONGROUND)
-    {
-        /* convert horizontal velocity vec to angular yaw*/
-        float rawYawIdeal = (atan2(-entity->velocity()[1], -entity->velocity()[0]) * M_RADPI);
-        if (rawYawIdeal < 0.0f)
-            rawYawIdeal += 180.0f;
-
-        moveYawIdeal = build_server_abs_yaw(entity, Helpers::angleNormalize(Helpers::angleDiff(rawYawIdeal, Animations::getFootYaw())));
-    }
-
-    /* Return m_flMoveYaw */
-    return moveYawIdeal;
-}
-
-void Resolver::MovingLayers()
-{
-    resolve_update_animations(player);
-
-    int idx = player->index();
-
-    float move_delta = 0.f;
-    const auto delta_positive = fabsf(player_record->layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate - player_record->resolver_layers[ROTATE_RIGHT][ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate);
-    const auto delta_negative = fabsf(player_record->layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate - player_record->resolver_layers[ROTATE_LEFT][ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate);
-    const auto delta_eye = fabsf(player_record->layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate - player_record->resolver_layers[ROTATE_SERVER][ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate);
-
-    if (move_delta <= delta_eye)
-        move_delta = delta_eye;
-    else if (move_delta > delta_eye)
-        move_delta = delta_negative;
-    else
-        move_delta = delta_positive;
-
-    if (!(move_delta * 10000.0f) || (delta_eye * 10000.0f) != (delta_negative * 10000.0f)) {
-        if (move_delta == delta_negative) {
-            ResolveSide[idx] = -1;
-        }
-        else {
-            ResolveSide[idx] = 1;
-        }
-    }
-}
-
-void Resolver::StoreAntifreestand()
-{
-    Vector forward{};
-    Vector right{};
-    Vector up{};
-    Trace tr;
-    auto animstate = player->getAnimstate();
-
-    float LeftSide = animstate->eyeYaw - 60.0f;
-    float RightSide = animstate->eyeYaw + 60.0f;
-
-    Vector m_vecDirectionLeft, m_vecDirectionRight;
-    Vector m_vecDesyncLeft(0.0f, LeftSide, 0.0f);
-    Vector m_vecDesyncRight(0.0f, RightSide, 0.0f);
-
-    Helpers::AngleVectors(m_vecDesyncLeft, &m_vecDirectionRight, &forward, &up);
-    Helpers::AngleVectors(m_vecDesyncRight, &m_vecDirectionLeft, &forward, &up);
-
-    const auto m_vecSrc = LocalPlayer()->getEyePosition();
-    const auto m_vecLeftSrc = m_vecSrc + (m_vecDesyncLeft * 8192.f);
-    const auto m_vecRightSrc = m_vecSrc + (m_vecDesyncRight * 8192.f);
-
-    interfaces->engineTrace->traceRay(Ray(m_vecSrc, m_vecLeftSrc), MASK_SHOT, { player }, tr);
-    float left_two = (tr.endpos - tr.startpos).length();
-
-    interfaces->engineTrace->traceRay(Ray(m_vecSrc, m_vecLeftSrc), MASK_SHOT, { player }, tr);
-    float right_two = (tr.endpos - tr.startpos).length();
-
-    if (left_two > right_two)
-        FreestandSide[player->index()] = 1;
-    else if (left_two < right_two)
-        FreestandSide[player->index()] = -1;
-    else
-        FreestandSide[player->index()] = 0;
-}
-
-bool ValidPitch(Entity* entity)
-{
-    int pitch = entity->eyeAngles().x;
-    return pitch == 0 || pitch > 90 || pitch < -90;
-}
-
-void Resolver::ResolveStand()
-{
-    int idx = player->index();
-    resolve_update_animations(player);
-}
-
-float flAngleMod(float flAngle)
-{
-    return((360.0f / 65536.0f) * ((int32_t)(flAngle * (65536.0f / 360.0f)) & 65535));
-}
-
-float ApproachAngle(float flTarget, float flValue, float flSpeed)
-{
-    flTarget = flAngleMod(flTarget);
-    flValue = flAngleMod(flValue);
-
-    float delta = flTarget - flValue;
-
-    if (flSpeed < 0)
-        flSpeed = -flSpeed;
-
-    if (delta < -180)
-        delta += 360;
-    else if (delta > 180)
-        delta -= 360;
-
-    if (delta > flSpeed)
-        flValue += flSpeed;
-    else if (delta < -flSpeed)
-        flValue -= flSpeed;
-    else
-        flValue = flTarget;
-
-    return flValue;
-}
-
-void Resolver::ApplyAngle(Entity* entity) {
-    auto resolver_info = m_info[entity->index()];
-
-    if (resolver_info.m_valid)
+void Resolver::processMissedShots() noexcept {
+    if (!enabled || snapshots.empty())
         return;
 
-    auto state = player->getAnimstate();
-    if (!state)
-        return;
-
-    // apply resolved angle
-    float angle = resolver_info.m_dsyangle * resolver_info.m_side;
-    state->eyeYaw = Helpers::angleNormalize((entity->eyeAngles().y + angle));
-
-    // force roll
-    if (resolver_info.m_roll)
-        entity->eyeAngles().z = Helpers::angleNormalize(50.f * -resolver_info.m_side);
-}
-
-//Rip legit aa resolving, todo: make a fix for this.
-//Gheto but works good if the target does not know you have this LOL.
-bool Resolver::DoesHaveFakeAngles(Entity* entity) {
-    if (entity->eyeAngles().x > 0.f && entity->eyeAngles().x < 85.f)
-        return false;
-
-    if (entity->eyeAngles().x < 0.f && entity->eyeAngles().x > -85.f)
-        return false;
-
-    return true;
-}
-
-//This is not always accurate so make sure to improve it in the future so we get more accurate results.
-bool Resolver::GetLowDeltaState(Entity* entity) {
-    auto animstate = entity->getAnimstate();
-
-    float fl_eye_yaw = entity->eyeAngles().y;
-    float fl_desync_delta = remainderf(fl_eye_yaw, animstate->footYaw);
-    fl_desync_delta = std::clamp(fl_desync_delta, -60.f, 60.f);
-
-    if (fabs(fl_desync_delta) < 30.f)
-        return true;
-
-    return false;
-}
-
-void Resolver::ResolveAir()
-{
-    resolve_update_animations(player);
-
-    int i = player->index();
-}
-
-void Resolver::ResolveJitter()
-{
-    auto animstate = player->getAnimstate();
-    auto jitter_first_side = player_record->Right;
-    auto jitter_second_side = player_record->Left;
-}
-
-void Resolver::detect_jitter(Animations::Players player, Entity* entity) noexcept
-{
-    auto& info = resolver_info[entity->index()];
-    auto& jitter = info.jitter;
-    float current_yaw = entity->eyeAngles().y;
-
-    // Update yaw cache with the current yaw
-    jitter.yaw_cache[jitter.yaw_cache_offset % 16] = current_yaw;
-    jitter.yaw_cache_offset = (jitter.yaw_cache_offset + 1) % 16;
-
-    int static_ticks = 0;
-    int jitter_ticks = 0;
-
-    // Evaluate the differences in yaw cache
-    for (int i = 0; i < 14; ++i) {
-        float diff = std::fabsf(jitter.yaw_cache[i] - jitter.yaw_cache[i + 1]);
-
-        if (diff <= 0.f) {
-            static_ticks++;
-        }
-        else if (diff >= 15.f) {
-            jitter_ticks++;
-        }
-    }
-
-    // Check if the player is jittering based on ticks
-    jitter.is_jitter = jitter_ticks > static_ticks;
-    info.is_jittering = jitter.is_jitter;
-
-}
-
-//This function just bruteforces where there hitbox will be so we can hit it. (duh)
-float Resolver::BruteForce(Entity* entity, bool roll) {
-    auto animstate = player->getAnimstate();
-
-    auto idx = entity->index();
-    auto missed_shot = missed_shots[idx];
-
-    float delta = 60.f;
-    if (!roll) {
-        switch (missed_shot % 6) {
-        case 3:
-            delta = 0.f;
-            break;
-        case 4:
-            delta = 58.f;
-            break;
-        case 5:
-            delta = -58.f;
-            break;
-        case 6:
-            delta = 29.f;
-            break;
-        case 7:
-            delta = -29.f;
-            break;
-        default:
-            delta = 0.f;
-            break;
-        }
-    }
-    else {
-        switch (missed_shot % 6) {
-        case 3:
-            delta = 50.f;
-            break;
-        case 4:
-            delta = -50.f;
-            break;
-        case 5:
-            delta = 25.f;
-            break;
-        case 6:
-            delta = -25.5f;
-            break;
-        case 7:
-            delta = 0.f;
-            break;
-        default:
-            delta = 0.f;
-            break;
-        }
-    }
-
-    return delta;
-}
-
-float GetBackwardYaw(Entity* entity) { return Helpers::calculate_angle(localPlayer->getAbsOrigin(), entity->getAbsOrigin()).y; }
-int Resolver::detect_freestanding(Entity* entity)
-{
-    Vector src3D, dst3D, forward, right, up;
-    float back_two, right_two, left_two;
-    Trace tr;
-
-    Helpers::AngleVectors(Vector(0, GetBackwardYaw(entity), 0), &forward, &right, &up);
-
-    src3D = player->getEyePosition();
-    dst3D = src3D + (forward * 380);
-
-    interfaces->engineTrace->traceRay({ src3D, dst3D }, MASK_SHOT, { entity }, tr);
-    back_two = (tr.endpos - tr.startpos).Length();
-
-    interfaces->engineTrace->traceRay(Ray(src3D + right * 35, dst3D + right * 35), MASK_SHOT, { entity }, tr);
-    right_two = (tr.endpos - tr.startpos).Length();
-
-    interfaces->engineTrace->traceRay(Ray(src3D - right * 35, dst3D - right * 35), MASK_SHOT, { entity }, tr);
-    left_two = (tr.endpos - tr.startpos).Length();
-
-    if (left_two > right_two)
-        return -1;
-    else if (right_two > left_two)
-        return 1;
-    else
-        return 0;
-}
-
-_NODISCARD static constexpr float(max1)() noexcept {
-    return FLT_MAX;
-}
-float Resolver::GetAwayAngle(adjust_data* record) {
-    float  delta{ max1() };
-    ang_t  away;
-    Vector forward, right, up;
-
-    Helpers::AngleVectors(localPlayer->origin() - record->m_pred_origin, &forward, &right, &up);
-    return away.y;
-
-}
-
-bool Resolver::IsYawSideways(Entity* entity, float yaw)
-{
-    auto local_player = localPlayer;
-    if (!local_player)
-        return false;
-
-    const auto at_target_yaw = Helpers::calculate_angle(local_player->origin(), entity->origin()).y;
-    const float delta = fabs(Helpers::normalizeYaw(at_target_yaw - yaw));
-
-    return delta > 20.f && delta < 160.f;
-}
-
-// pi constants.
-constexpr float pi = 3.1415926535897932384f; // pi
-constexpr float pi_2 = pi * 2.f;               // pi * 2
-// radians to degrees.
-__forceinline constexpr float rad_to_deg(float val) {
-    return val * (180.f / pi);
-}
-void Resolver::ResolveAir1(adjust_data* data, Entity* entity) {
-
-    // we have barely any speed. 
-    // either we jumped in place or we just left the ground.
-    // or someone is trying to fool our resolver.
-    if (entity->velocity().length2D() < 60.f) {
-        // set this for completion.
-        // so the shot parsing wont pick the hits / misses up.
-        // and process them wrongly.
-        m_mode = Modes::RESOLVE_STAND;
-
-        // invoke our stand resolver.
-        ResolveStand(); // later resolvestand 1
-
-        // we are done.
-        return;
-    }
-
-    // try to predict the direction of the player based on his velocity direction.
-    // this should be a rough estimation of where he is looking.
-    float velyaw = rad_to_deg(std::atan2(data->m_velocity.y, data->m_velocity.x));
-
-    switch (data->m_shots % 3) {
-    case 0:
-        entity->eyeAngles().y = velyaw + 180.f;
-        break;
-
-    case 1:
-        entity->eyeAngles().y = velyaw - 90.f;
-        break;
-
-    case 2:
-        entity->eyeAngles().y = velyaw + 90.f;
-        break;
-    }
-}
-
-void Resolver::ResolveWalk(adjust_data* data, Entity* entity) {
-    // apply lby to eyeangles.
-    entity->eyeAngles().y = data->m_body;
-
-    // reset stand and body index.
-    data->m_body_index = 0;
-    data->m_stand_index = 0;
-    data->m_stand_index1 = 0;
-    data->m_reverse_fs = 0;
-    data->m_stand_index3 = 0;
-    data->m_last_move = 0;
-    data->m_has_body_updated = false;
-
-    // copy the last record that this player was walking
-    // we need it later on because it gives us crucial data.
-    std::memcpy(&data->m_walk_record, entity, sizeof(adjust_data));
-}
-
-void Resolver::SetMode(adjust_data* record) {
-    // the resolver has 3 modes to chose from.
-    // these modes will vary more under the hood depending on what data we have about the player
-    // and what kind of hack vs. hack we are playing (mm/nospread).
-
-    float speed = record->m_anim_velocity.length();
-
-    // if on ground, moving, and not fakewalking.
-    if ((record->m_flags & FL_ONGROUND) && speed > 0.1f && !record->m_fake_walk)
-        record->m_mode = Modes::RESOLVE_WALK;
-
-    // if on ground, not moving or fakewalking.
-    if ((record->m_flags & FL_ONGROUND) && (speed <= 0.1f || record->m_fake_walk))
-        record->m_mode = Modes::RESOLVE_STAND;
-
-    // if not on ground.
-    else if (!(record->m_flags & FL_ONGROUND))
-        record->m_mode = Modes::RESOLVE_AIR;
-}
-
-void Resolver::MatchShot(adjust_data* data, Entity* entity) {
-    // do not attempt to do this in nospread mode.
-   // if (g_menu.main.config.mode.get() == 1)
-   //     return;
-
-    float shoot_time = -1.f;
-
-    const auto activeWeapon = localPlayer->getActiveWeapon();
-    if (activeWeapon) {
-        // with logging this time was always one tick behind.
-        // so add one tick to the last shoot time.
-        shoot_time = activeWeapon->m_fLastShotTime() + memory->globalVars->intervalPerTick;
-    }
-
-    // this record has a shot on it.
-    if (TIME_TO_TICKS(shoot_time) == TIME_TO_TICKS(entity->simulationTime())) {
-        if (data->m_lag <= 2)
-            data->m_shot = true;
-
-        // more then 1 choke, cant hit pitch, apply prev pitch.
-        else if (data->m_records.size() >= 2) {
-            adjust_data* previous = data->m_records[1].get();
-
-            if (previous && !previous->dormant())
-                data->m_eye_angles.x = previous->m_eye_angles.x;
-        }
-    }
-}
-
-void Resolver::resolve_entity(Animations::Players& player, Animations::Players prev_player, Entity* entity) {
-
-    // ignore bots
-    if (entity->isBot())
-        return;
-
-    // get the players max rotation.
-    if (DesyncDetect(entity) == false)
-        return;
-
-    if (!entity || !entity->getAnimstate())
-        return;
-
-    if (detect_freestanding(entity) == -1 || detect_freestanding(entity) == 1)
-        return;
-
-    // mark this record if it contains a shot.
-    MatchShot(player_record - 1, entity);
-
-    // next up mark this record with a resolver mode that will be used.
-    SetMode(player_record - 1);
-
-    // force them down.
-    entity->eyeAngles().x = 89.f;
-
-    // we arrived here we can do the acutal resolve.
-    if (m_mode == Modes::RESOLVE_WALK)
-        ResolveWalk(player_record, entity);
-
-    else if (m_mode == Modes::RESOLVE_AIR)
-        ResolveAir1(player_record, entity);
-
-
-    const int iEntityID = entity->index();
-    static float flFakePitch[65];
-
-    if (fabsf(entity->getAnimstate()->eyePitch) == 180.f)
-        flFakePitch[iEntityID] = entity->getAnimstate()->eyePitch;
-    else if (bDidShot) flFakePitch[iEntityID] = NULL;
-
-    if (fabsf(flFakePitch[iEntityID]) == 180.f)
-        entity->eyeAngles() = Vector(89.f, entity->getAnimstate()->eyeYaw, 0.f);
-
-    auto& resolver_info = m_info[entity->index()];
-    resolver_info.m_valid = false;
-    auto animstate = entity->getAnimstate();
-
-    // there is history resolver, grab info from it
-    // TO-DO: disable history when resolved side changes
-    auto& history = m_history[entity->index()];
-    if (!history.empty()) {
-        // grab latest resolver data
-        auto& history_resolver = history.front();
-
-        resolver_info.m_history = true;
-        resolver_info.m_side = history_resolver.m_side;
-        resolver_info.m_mode = history_resolver.m_mode;
-        resolver_info.m_dsyangle = history_resolver.m_dsyangle;
-        return;
-    }
-
-    resolver_history res_history = HISTORY_UNKNOWN;
-    resolver_type type = resolver_type(-1);
-
-    bool is_player_zero = false;
-
-    if (res_history == HISTORY_ZERO)
-        is_player_zero = true;
-
-    auto choked = abs(TIME_TO_TICKS(entity->simulationTime() - entity->oldSimulationTime()) - 1);
-    bool is_player_faking = false;
-    if (fabs(original_pitch) > 65.f || choked >= 1 || is_player_faking)
-        fake = true;;
-
-    Resolver::ApplyAngle(entity);
-
-    ///////////////////// [ ANIMLAYERS ] /////////////////////
-    auto i = entity->index();
-    AnimationLayer layers[13];
-    memcpy(layers, entity->get_animlayers(), entity->animlayer_count() * sizeof(AnimationLayer));
-
-    Vector velocity = entity->m_vecVelocity();
-    if (const float spd = velocity.squareLength(); spd > std::powf(1.2f * 260.0f, 2.f))
-    {
-        const Vector velocity_normalized = velocity.normalized();
-        velocity = velocity_normalized * (1.2f * 260.0f);
-    }
-
-    int idx = entity->index();
-
-    const auto slow_walking = animstate->footYaw >= 0.01f && animstate->footYaw <= 0.8f;
-
-    if (slow_walking)
-    {
-        if (animstate->footYaw != animstate->footYaw)
-            animstate->footYaw = animstate->footYaw * side;
-    }
-
-    /* vars */
-    float footYaw = Animations::getFootYaw();
-
-    float max_rotation = entity->getMaxDesyncAngle();
-    int index = 0;
-    const float eye_yaw = entity->getAnimstate()->eyeYaw;
-
-    bool OnAir = entity->flags() & FL_ONGROUND && !entity->getAnimstate()->landedOnGroundThisFrame;
-    bool Ducking = entity->getAnimstate()->animDuckAmount && entity->flags() & FL_ONGROUND && !entity->getAnimstate()->landedOnGroundThisFrame;
-    float Speed = entity->velocity().length2D();
-    auto valid_lby = true;
-
-    if (!animstate && choked == 0 || !animstate, choked == 0)
-        return;
-
-    float lby = entity->lby();
-    bool crouching = entity->flags() & FL_ONGROUND && !entity->getAnimstate()->landedOnGroundThisFrame;
-    if (crouching)
-        entity->getAnimstate()->footYaw = Helpers::normalizeYaw(entity->eyeAngles().y + lby);
-
-    Resolver::apply_side(entity, choked);
-
-    //RIFK RESOLVER
-    const auto missed_shots1 = missed_shots[entity->index()];
-    auto logic_resolver_1 = [&]() // rifk7 resolver with changes
-        {
-            const auto local = LocalPlayer();
-
-            if (!localPlayer)
-                return 0.f;
-
-            auto resolver_yaw = 0.f;
-            auto freestanding_yaw = 0.f;
-
-            const auto current_shot = missed_shots1 % 2;
-            float max_desync_angle = 29.f;
-
-            const auto plus_desync = entity->eyeAngles().y + max_desync_angle;
-            const auto minus_desync = entity->eyeAngles().y - max_desync_angle;
-
-            StoreAntifreestand();
-
-            const auto diff_from_plus_desync = fabs(Helpers::angleDiff(freestanding_yaw, plus_desync));
-            const auto diff_from_minus_desync = fabs(Helpers::angleDiff(freestanding_yaw, minus_desync));
-
-            const auto first_yaw = diff_from_plus_desync < diff_from_minus_desync ? plus_desync : minus_desync;
-            const auto second_yaw = diff_from_plus_desync < diff_from_minus_desync ? minus_desync : plus_desync;
-            const auto third_yaw = Helpers::calculate_angle(localPlayer->getEyePosition(), entity->getEyePosition()).y;
-
-            switch (current_shot)
-            {
-            case 0:
-                resolver_yaw = first_yaw;
-                break;
-            case 1:
-                resolver_yaw = second_yaw;
-                break;
-            case 2:
-                resolver_yaw = third_yaw;
-                break;
-            default:
-                break;
-            }
-
-            return resolver_yaw;
-        };
-    //END RIFK RESOLVER
-
-    Resolver::detect_side(entity, &player.side);
-    Resolver::setup_detect(player, entity);//setup tha detections
-
-    if (freestand_target)
-    {
-        footYaw = Helpers::normalizeYaw((entity->eyeAngles().y + 90.f) * side);
-    }
-
-    UpdateShots(cmd);
-
-    float angle = get_angle(entity);
-    int new_side = 0;
-    if (DoesHaveJitter(entity) && entity->eyeAngles().x < 45) {
-        switch (missed_shots[idx] % 2) {
-        case 0:
-            ResolverMode[idx];
-            animstate->footYaw = Helpers::normalizeYaw(angle + 58.f * new_side);
-            break;
-        case 1:
-            ResolverMode[idx];
-            animstate->footYaw = Helpers::normalizeYaw(angle - 58.f * new_side);
-            break;
-        }
-    }
-
-    bool IsLowDelta = GetLowDeltaState(entity);
-    const bool& Sideways = fabsf(Helpers::normalizeYaw((angle - GetLeftYaw(entity))) < 45.f || fabsf(Helpers::normalizeYaw(angle - GetRightYaw(entity))) < 45.f); //Use this for sideways check.
-    auto missed_shot = missed_shots[idx];
-    //Simple fix to over max brute fix.
-    if (missed_shot == 8 || missed_shot > 7) {
-        missed_shot = 0;
-        return;
-    }
-    //Resolve desync.
-    if (DoesHaveFakeAngles(entity)) {
-        if (missed_shot > 2 || missed_shot == 2) {
-            desync_angle = BruteForce(entity, false);
-            goto Skip_logic;
-        }
-        else if (Sideways) {
-            should_force_safepoint = true;
-            goto Skipped;
-        }
-        else {
-            should_force_safepoint = false;
-
-            if (detect_side)
-                desync_angle = !IsLowDelta ? 58 : 29;
-            else
-                desync_angle = !IsLowDelta ? -58 : -29;
-        }
-
-    }
-Skip_logic:
-    //Set our goal feet yaw and we now hit p100.
-    animstate->footYaw = Helpers::angleNormalize(entity->eyeAngles().y + desync_angle);
-Skipped:
-    //Set globals
-    desync = desync_angle;
-
-    //Set our pitch to the original players.
-    //todo: Add a no spread resolver 💀 :skull:
-    entity->eyeAngles().x = original_pitch;
-
-    resolve_update_animations(entity);
-
-    ValidPitch(entity);
-
-    if (!player.extended && fabs(max_rotation) > 58.f)
-    {
-        max_rotation = max_rotation / 1.8f;
-    }
-
-    // resolve shooting players separately.
-    if (player.shot) {
-        entity->getAnimstate()->footYaw = eye_yaw + resolve_shot(player, entity);
-        return;
-    }
-    if (entity->velocity().length2D() <= 0.1f) {
-        const float angle_difference = Helpers::angleDiff(eye_yaw, entity->getAnimstate()->footYaw);
-        index = 2 * angle_difference <= 0.0f ? 1 : -1;
-    }
-    else
-    {
-        if (!((int)player.layers[12].weight * 1000.f) && entity->velocity().length2D() > 0.1) {
-
-            auto m_layer_delta1 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate);
-            auto m_layer_delta2 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate);
-            auto m_layer_delta3 = abs(player.layers[6].playbackRate - player.oldlayers[6].playbackRate);
-
-            if (m_layer_delta1 < m_layer_delta2
-                || m_layer_delta3 <= m_layer_delta2
-                || (signed int)(float)(m_layer_delta2 * 1000.0))
-            {
-                if (m_layer_delta1 >= m_layer_delta3
-                    && m_layer_delta2 > m_layer_delta3
-                    && !(signed int)(float)(m_layer_delta3 * 1000.0))
-                {
-                    index = 1;
-                }
-            }
-            else
-            {
-                index = -1;
-            }
-        }
-    }
-
-    if (!animstate)
-    {
-        player_record->side = RESOLVER_ORIGINAL;
-        return;
-    }
-
-    if (entity->getAnimstate()->velocityLengthXY > 0.1f && fabsf(entity->getAnimstate()->velocityLengthZ) > 100.0f)
-    {
-
-        player.anim_resolved = false;
-
-        int m_side = 0;
-        bool m_can_animate;
-
-        /* animlayers.*/
-        /* check if we have a previous record stored we can compare to, if we are currently running animations related to body lean and check if the movement speed (movement layer playback rate) of both records match. */
-        if (!(player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].weight * 1000.0f))
-        {
-            if (player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].weight * 1000.0f == prev_player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].weight * 1000.0f)
-            {
-                /* compare networked layer to processed layer w / m_flFootYaw lerped with positive delta. */
-                const float delta_left = player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate;
-
-                /* compare networked layer to processed layer. */
-                const float delta_center = player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate;
-
-                /* compare networked layer to processed layer. quad */
-                const float delta_quad = player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate;
-
-                /* compare networked layer to processed layer w/ m_flFootYaw lerped with negative delta. */
-                const float delta_right = player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate;
-
-                bool m_finally_active{};
-                if (!(delta_quad * 1000.f))
-                    m_finally_active = true;
-
-                m_side = 0;
-
-                float last_delta = abs(player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].playbackRate - delta_quad);
-
-                if (delta_center * 1000.f || delta_quad < delta_center)
-                    m_can_animate = m_finally_active;
-                else
-                {
-                    player.rotation_mode = ROTATION_MOVE; /* record is mode resolve. */
-                    m_can_animate = true;
-                    m_side = ROTATION_SIDE_CENTER; /* record is desync. */
-                    last_delta = delta_center;
-                }
-
-                if (!player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].weight)
-                    player.rotation_mode = ROTATION_MOVE;
-                m_can_animate = true;
-                m_side = ROTATION_SIDE_LEFT;
-                last_delta = delta_center;
-
-                if (!(delta_left * 1000.f) && last_delta >= delta_left)
-                {
-                    m_can_animate = true;
-                    m_side = ROTATION_SIDE_RIGHT; /* record is desync. */
-                    last_delta = delta_left;
-                }
-
-                if (!(delta_right * 1000.f) && last_delta >= delta_right)
-                {
-                    m_can_animate = true;
-                    m_side = ROTATION_SIDE_LEFT; /* record is desync. */
-                    return;
-                }
-            }
-            else
-            {
-                m_can_animate = false;
-
-            }
-        }
-
-        entity->getAnimstate()->setupVelocity(); // setup vel
-
-        footYaw = resolve_shot(player, entity);
-        footYaw = resolve_move_yaw(player, entity);
-        footYaw = build_move_yaw(entity);
-
-        /* last hit. */
-        player.anim_resolved = m_can_animate;
-        player.rotation_side = m_side;
-
-        switch (player.misses % 3) {
-        case 0: //default
-            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y + max_rotation * static_cast<float>(index));
-            break;
-        case 1: //reverse
-            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y + max_rotation * static_cast<float>(-index));
-            break;
-        case 2: //middle
-            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y);
-            break;
-        default: break;
-        }
-
-    }
-
-    // normalize the eye angles, doesn't really matter but its clean.
-    Helpers::normalizeYaw(entity->eyeAngles().y);
-}
-
-bool IsAdjustingBalance(const Animations::Players& player, Entity* entity)
-{
-    for (int i = 0; i < 15; i++)
-    {
-        const int activity = entity->sequence();
-        if (activity == 979)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool is_breaking_lby(const Animations::Players& player, Entity* entity, AnimationLayer cur_layer, AnimationLayer prev_layer)
-{
-    if (IsAdjustingBalance(player, entity))
-    {
-        if ((prev_layer.cycle != cur_layer.cycle) || cur_layer.weight == 1.f)
-        {
-            return true;
-        }
-        else if (cur_layer.cycle == 0.f && (prev_layer.cycle > 0.92f && cur_layer.cycle > 0.92f))
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-float Resolver::resolve_shot(const Animations::Players& player, Entity* entity)
-{
-    const float fl_pseudo_fire_yaw = Helpers::angleNormalize(Helpers::angleDiff(localPlayer->origin().y, player.matrix[8].origin().y));
-
-    float max_rotation = entity->lby();
-    float resolve_value = entity->getMaxDesyncAngle();
-    const int m_missed_shots = player.misses;
-    const auto& info = resolver_info[entity->index()];
-
-    float yaw_resolve = 0.f;
-
-    /* miss & dsy val */
-    if (m_missed_shots > 0)
-        resolve_value *= -1;
-
-    /* side layers */
-    if (player.rotation_side != 0)
-        resolve_value *= player.rotation_side; // Adjust the desync based on the rot side
-
-    /* clamp angle */
-    if (max_rotation < resolve_value)
-        resolve_value = max_rotation;
-
-    /* detect if entity is using max desync angle */
-    yaw_resolve = resolve_value = max_rotation;
-
-    /* vars side */
-    const float fl_left_fire_yaw_delta = fabsf(Helpers::angleNormalize(fl_pseudo_fire_yaw - (entity->eyeAngles().y + ROTATION_SIDE_LEFT)));
-    const float fl_right_fire_yaw_delta = fabsf(Helpers::angleNormalize(fl_pseudo_fire_yaw - (entity->eyeAngles().y - ROTATION_SIDE_RIGHT)));
-
-    /* vars yaw */
-    const auto side_res = player.rotation_side ? fl_left_fire_yaw_delta : fl_right_fire_yaw_delta;
-    //const auto is_jitter = abs(fl_pseudo_fire_yaw - entity->eyeAngles().y) > entity->getMaxDesyncAngle();
-    const auto is_jitter = info.is_jittering;
-    float velocityLengthXY = entity->velocity().length2D();
-    const float stand = abs(velocityLengthXY < 260.0f);
-    const float move = (!player.layers[ANIMATION_LAYER_MOVEMENT_MOVE].weight, velocityLengthXY > 260.0f);
-    if (velocityLengthXY > 0 && entity->flags() & FL_ONGROUND)
-    {
-        // convert horizontal velocity vec to angular yaw
-        float flRawYawIdeal = (velocityLengthXY > 0 && entity->flags() * M_RADPI);
-        if (flRawYawIdeal < 0.0f)
-            flRawYawIdeal += 360.0f;
-
-        const auto m_flMoveYawIdeal = Helpers::angleNormalize(Helpers::angleDiff(flRawYawIdeal, Animations::getFootYaw()));
-    }
-
-
-    if (player.layers[ANIMATION_LAYER_ADJUST].sequence == 979, entity->eyeAngles().y > 119.f)
-        if (player.layers[ANIMATION_LAYER_ADJUST].sequence == 0, entity->eyeAngles().y > 0.f)
-        {
-            const auto m_side = 2 * int(Helpers::angleNormalize(entity->eyeAngles().y) >= 0.f) - 1;
-            const auto m_resolve_value = 60.f;
-        }
-    /* brute */
-    if (is_jitter) /* jitter brute */
-    {
-        switch (m_missed_shots % 3)
-        {
-        case ROTATION_SIDE_LEFT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y + yaw_resolve));
-            break;
-        case ROTATION_SIDE_CENTER:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y));
-            break;
-        case ROTATION_SIDE_RIGHT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y - yaw_resolve));
-            break;
-        }
-    }
-    else /* last brute */
-    {
-        switch (m_missed_shots % 5)
-        {
-        case ROTATION_SIDE_CENTER:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y));
-            break;
-        case ROTATION_SIDE_LEFT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y + 58.f));
-            break;
-        case ROTATION_SIDE_RIGHT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y - 58.f));
-            break;
-        case ROTATION_SIDE_LOW_LEFT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y + 28.f));
-            break;
-        case ROTATION_SIDE_LOW_RIGHT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y - 28.f));
-            break;
-        }
-    }
-
-    float fl_eye_yaw = entity->getAnimstate()->eyeYaw;
-    float fl_first_low_delta = (fl_eye_yaw + 35.0f);
-    float fl_second_low_delta = (fl_eye_yaw + 29.0f);
-
-    if (GetLowDeltaState(entity)) {
-        switch (m_missed_shots % 3) {
-            // low delta
-        case 0:
-            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y + fl_first_low_delta * player.side); // low delta brute 1st
-            break;
-        case 1:
-            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y + fl_second_low_delta * player.side); // low delta brute 2cd
-            break;
-        case 2:
-            entity->getAnimstate()->footYaw = build_server_abs_yaw(entity, entity->eyeAngles().y); // zero
-            break;
-        }
-    }
-
-    if (move) /* move fix */
-    {
-        auto footYaw = resolve_move_yaw(player, entity);
-        return footYaw;
-
-    }
-
-    bool resolverMissed = false;
-    if (!resolverMissed)
-    {
-
-        switch (m_missed_shots % 3)
-        {
-        case ROTATION_SIDE_CENTER:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y));
-            break;
-        case ROTATION_SIDE_LEFT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y + 45.f));
-            break;
-        case ROTATION_SIDE_RIGHT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y - 45.f));
-            break;
-        }
-
-
-    }
-
-
-
-    if (stand) /* stand fix */
-    {
-
-
-        const auto feet_delta = Helpers::angleNormalize(Helpers::angleDiff(Helpers::angleNormalize(entity->getAnimstate()->timeToAlignLowerBody), Helpers::angleNormalize((entity->eyeAngles().y))));
-
-        const auto eye_diff = Helpers::angleDiff(entity->eyeAngles().y, (entity->getAnimstate()->eyeYaw));
-
-
-        auto stopped_moving = (player.layers[ANIMATION_LAYER_ADJUST].sequence) == ACT_CSGO_IDLE_ADJUST_STOPPEDMOVING;
-
-
-        auto balance_adjust = (player.layers[ANIMATION_LAYER_ADJUST].sequence) == ACT_CSGO_IDLE_TURN_BALANCEADJUST;
-
-
-        bool stopped_moving_this_frame = false;
-        if (entity->getAnimstate()->velocityLengthXY <= 0.1f)
-        {
-            auto  m_duration_moving = ROTATION_MOVE;
-            auto m_duration_still = entity->getAnimstate()->lastUpdateIncrement;
-
-            auto stopped_moving_this_frame = entity->getAnimstate()->velocityLengthXY < 0;
-            m_duration_moving == 0.0f;
-            m_duration_still += (entity->getAnimstate()->lastUpdateIncrement);
-
-        }
-
-
-        if (entity->getAnimstate()->velocityLengthXY == 0.0f && entity->getAnimstate()->landAnimMultiplier == 0.0f && entity->getAnimstate()->lastUpdateIncrement > 0.0f)
-        {
-            const auto current_feet_yaw = entity->getAnimstate()->eyeYaw;
-            const auto goal_feet_yaw = entity->getAnimstate()->eyeYaw;
-            auto eye_delta = current_feet_yaw - goal_feet_yaw;
-
-            if (goal_feet_yaw < current_feet_yaw)
-            {
-                if (eye_delta >= 180.0f)
-                    eye_delta -= 360.0f;
-            }
-            else if (eye_delta <= -180.0f)
-                eye_delta += 360.0f;
-
-            if (eye_delta / entity->getAnimstate()->lastUpdateIncrement > 120.f)
-            {
-                (player.layers[ANIMATION_LAYER_ADJUST].sequence) == 0.0f;
-                (player.layers[ANIMATION_LAYER_ADJUST].sequence) == 0.0f;
-
-            }
-        }
-
-    }
-    else /* last brute */
-    {
-        switch (m_missed_shots % 5)
-        {
-        case ROTATION_SIDE_CENTER:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y));
-            break;
-        case ROTATION_SIDE_LEFT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y + 58.f));
-            break;
-        case ROTATION_SIDE_RIGHT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y - 58.f));
-            break;
-        case ROTATION_SIDE_LOW_LEFT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y + 28.f));
-            break;
-        case ROTATION_SIDE_LOW_RIGHT:
-            build_server_abs_yaw(entity, Helpers::angleNormalize(entity->eyeAngles().y - 28.f));
-            break;
-        }
-    }
-
-}
-
-void Resolver::setup_detect(Animations::Players& player, Entity* entity) {
-
-    // detect if player is using maximum desync.
-    if (player.layers[3].cycle == 0.f)
-    {
-        if (player.layers[3].weight = 0.f)
-        {
-            player.extended = true;
-        }
-    }
-    /* calling detect side */
-    Resolver::detect_side(entity, &player.side);
-    int side = player.side;
-    /* bruting vars */
-    float resolve_value = 50.f;
-    static float brute = 0.f;
-    float fl_max_rotation = entity->getMaxDesyncAngle();
-    float fl_eye_yaw = entity->getAnimstate()->eyeYaw;
-    float perfect_resolve_yaw = resolve_value;
-    bool fl_foword = fabsf(Helpers::angleNormalize(get_angle(entity) - get_foword_yaw(entity))) < 90.f;
-    int fl_shots = player.misses;
-
-    /* clamp angle */
-    if (fl_max_rotation < resolve_value) {
-        resolve_value = fl_max_rotation;
-    }
-
-    /* detect if entity is using max desync angle */
-    if (player.extended) {
-        resolve_value = fl_max_rotation;
-    }
-    /* setup brting */
-    if (fl_shots == 0) {
-        brute = perfect_resolve_yaw * (fl_foword ? -side : side);
-    }
-    else {
-        switch (fl_shots % 3) {
-        case 0: {
-            brute = perfect_resolve_yaw * (fl_foword ? -side : side);
-        } break;
-        case 1: {
-            brute = perfect_resolve_yaw * (fl_foword ? side : -side);
-        } break;
-        case 2: {
-            brute = 0;
-        } break;
-        }
-    }
-
-    /* fix goalfeet yaw */
-    entity->getAnimstate()->footYaw = fl_eye_yaw + brute;
-}
-
-Vector calc_angle(const Vector source, const Vector entity_pos) {
-    const Vector delta{ source.x - entity_pos.x, source.y - entity_pos.y, source.z - entity_pos.z };
-    const auto& [x, y, z] = cmd->viewangles;
-    Vector angles{ Helpers::rad2deg(atan(delta.z / hypot(delta.x, delta.y))) - x, Helpers::rad2deg(atan(delta.y / delta.x)) - y, 0.f };
-    if (delta.x >= 0.f)
-        angles.y += 180;
-    return angles;
-}
-
-
-void Resolver::UpdateShots(UserCmd* cmd) noexcept
-{
-    if (!localPlayer)
-        return;
-
-    if (!localPlayer->isAlive())
-    {
-        tick.clear();
-        bulletImpacts.clear();
-        for (auto& record : shot)
-            record.clear();
-        return;
-    }
-    return;
-
-}
-
-void Resolver::processMissedShots() noexcept
-{
-    if (!resolver)
-    {
+    if (!localPlayer || !localPlayer->isAlive()) {
         snapshots.clear();
         return;
     }
 
-    if (!localPlayer || !localPlayer->isAlive())
-    {
-        snapshots.clear();
+    auto& snapshot = snapshots.front();
+
+    if (snapshot.time < 0.f)
+        return;
+
+    if (memory->globalVars->serverTime() - snapshot.time > 1.f) {
+        snapshots.pop_front();
         return;
     }
 
-    if (snapshots.empty())
+    if (!snapshot.got_impact) {
+        snapshots.pop_front();
         return;
+    }
 
-    if (snapshots.front().time == -1) //Didnt get data yet
+    const auto entity = interfaces->entityList->getEntity(snapshot.player_index);
+    if (!entity) {
+        snapshots.pop_front();
         return;
-
-    auto snapshot = snapshots.front();
-    snapshots.pop_front(); //got the info no need for this
-
-    if (!snapshot.player.gotMatrix)
-        return;
-
-    const auto entity = interfaces->entityList->getEntity(snapshot.playerIndex);
-    if (!entity)
-        return;
+    }
 
     const Model* model = snapshot.model;
-    if (!model)
+    if (!model) {
+        snapshots.pop_front();
         return;
+    }
 
     StudioHdr* hdr = interfaces->modelInfo->getStudioModel(model);
-    if (!hdr)
+    if (!hdr) {
+        snapshots.pop_front();
         return;
+    }
 
     StudioHitboxSet* set = hdr->getHitboxSet(0);
-    if (!set)
+    if (!set) {
+        snapshots.pop_front();
         return;
-
-    std::array<std::uint8_t, 4> color;
-    if (!config->misc.logger.rainbow)
-    {
-        color.at(0) = static_cast<uint8_t>(config->misc.logger.color.at(0) * 255.0f);
-        color.at(1) = static_cast<uint8_t>(config->misc.logger.color.at(1) * 255.0f);
-        color.at(2) = static_cast<uint8_t>(config->misc.logger.color.at(2) * 255.0f);
     }
-    else
-    {
-        const auto [colorR, colorG, colorB] { rainbowColor(config->misc.logger.rainbowSpeed) };
-        color.at(0) = static_cast<uint8_t>(colorR * 255.0f);
-        color.at(1) = static_cast<uint8_t>(colorG * 255.0f);
-        color.at(2) = static_cast<uint8_t>(colorB * 255.0f);
-    }
-    color.at(3) = static_cast<uint8_t>(255.0f);
 
-    const auto angle = AimbotFunction::calculateRelativeAngle(snapshot.eyePosition, snapshot.bulletImpact, Vector{ });
-    const auto end = snapshot.bulletImpact + Vector::fromAngle(angle) * 2000.f;
-
-    const auto matrix = snapshot.backtrackRecord <= -1 ? snapshot.player.matrix.data() : snapshot.player.backtrackRecords.at(snapshot.backtrackRecord).matrix;
+    const auto angle = AimbotFunction::calculateRelativeAngle(
+        snapshot.eye_position,
+        snapshot.impact_position,
+        Vector{}
+    );
+    const auto end = snapshot.impact_position + Vector::fromAngle(angle) * 2000.f;
 
     bool resolverMissed = false;
-    for (int hitbox = 0; hitbox < Hitboxes::Max; hitbox++)
-    {
-        if (AimbotFunction::hitboxIntersection(matrix, hitbox, set, snapshot.eyePosition, end))
-        {
-            Helpers::logConsole(c_xor("[BLACKHOLE] "), color);
+    for (int hitbox = 0; hitbox < Hitboxes::Max; hitbox++) {
+        if (AimbotFunction::hitboxIntersection(snapshot.matrix, hitbox, set,
+            snapshot.eye_position, end)) {
             resolverMissed = true;
-            std::string missed = std::string(skCrypt("missed shot on ")) + entity->getPlayerName() + std::string(skCrypt(" due to decync correction in ")) + getStringFromHitbox(hitbox);
-            std::string missedBT = std::string(skCrypt("missed shot on ")) + entity->getPlayerName() + std::string(skCrypt(" due to invalid backtrack tick [")) + std::to_string(snapshot.backtrackRecord) + "] in " + getStringFromHitbox(hitbox);
-            std::string missedJitter = std::string(skCrypt("missed shot on ")) + entity->getPlayerName() + std::string(skCrypt(" due to jitter correction in ")) + getStringFromHitbox(hitbox);
-            if (snapshot.backtrackRecord == 1 && config->backtrack.enabled)
-            {
-                Logger::addRenderLog(missedJitter);
-                Helpers::logConsole(std::string(skCrypt("missed shot on ")) + entity->getPlayerName() + std::string(skCrypt(" due to ")));
-                Helpers::logConsole(std::string(skCrypt("jitter correction ")), { 178, 34, 34,255 });
-                Helpers::logConsole(std::string(skCrypt("in ")) + getStringFromHitbox(hitbox) + "\n");
-            }
-            else if (snapshot.backtrackRecord > 1 && config->backtrack.enabled)
-            {
-                Logger::addRenderLog(missedBT);
-                Helpers::logConsole(std::string(skCrypt("missed shot on ")) + entity->getPlayerName() + std::string(skCrypt(" due to ")));
-                Helpers::logConsole(std::string(skCrypt("invalid backtrack tick")), { 255, 165, 0, 255 });
-                Helpers::logConsole(std::string(skCrypt(" [")) + std::to_string(snapshot.backtrackRecord) + std::string(skCrypt("] in ")) + getStringFromHitbox(hitbox) + "\n");
-            }
-            else
-            {
-                Logger::addRenderLog(missed);
-                Helpers::logConsole(std::string(skCrypt("missed shot on ")) + entity->getPlayerName() + std::string(skCrypt(" due to ")));
-                Helpers::logConsole(std::string(skCrypt("decync correction ")), { 178, 34, 34,255 });
-                Helpers::logConsole(std::string(skCrypt("in ")) + getStringFromHitbox(hitbox) + "\n");
-            }
-            Animations::setPlayer(snapshot.playerIndex)->misses++;
+            data[snapshot.player_index].misses++;
 
-            ++misses;
-            hit_rate = (hits / (hits + misses)) * 100;
+            const auto& savedState = snapshot.resolver_state;
+            Logger::addLog("Resolver miss | Method: " + getMethodName(savedState.winning_method) +
+                " | Side: " + (savedState.side == ResolveSide::LEFT ? "L" :
+                    savedState.side == ResolveSide::RIGHT ? "R" : "O") +
+                " | Conf: " + std::to_string(static_cast<int>(savedState.confidence * 100)) + "%");
             break;
         }
     }
 
     if (!resolverMissed) {
-        Logger::addRenderLog(std::string(skCrypt("missed shot due to spread")));
-        Helpers::logConsole(c_xor("[BLACKHOLE] "), color);
-        Helpers::logConsole(std::string(skCrypt("missed shot ")) + std::string(skCrypt(" due to ")));
-        Helpers::logConsole(std::string(skCrypt("spread \n")), { 255, 255, 0,255 });
-
-        ++misses;
-        hit_rate = (hits / (hits + misses)) * 100;
-    }
-}
-
-void Resolver::runPreUpdate(Animations::Players player, Animations::Players prev_player, Entity* entity) noexcept
-{
-    if (!resolver)
-        return;
-
-    const auto misses = player.misses;
-    if (!entity || !entity->isAlive())
-        return;
-
-    if (!entity->isDormant())
-        return;
-
-    if (player.chokedPackets <= 0)
-        return;
-
-    if (snapshots.empty())
-        return;
-
-    auto& [snapshot_player, model, eyePosition, bulletImpact, gotImpact, time, playerIndex, backtrackRecord] = snapshots.front();
-
-    Resolver::setup_detect(player, entity);
-    Resolver::resolve_entity(player, prev_player, entity);
-    Resolver::initialize(entity, player_record, original_goal_feet_yaw, original_pitch);
-    //detect_jitter(player, entity);
-}
-
-void Resolver::runPostUpdate(Animations::Players player, Animations::Players prev_player, Entity* entity) noexcept
-{
-    if (!resolver)
-        return;
-
-    const auto misses = player.misses;
-    if (!entity || !entity->isAlive())
-        return;
-
-    if (!entity->isDormant())
-        return;
-
-    if (player.chokedPackets <= 0)
-        return;
-
-    if (entity->velocity().length2D() > 3.0f) {
-        Animations::setPlayer(entity->index())->absAngle.y = entity->eyeAngles().y;
-        return;
+        Logger::addLog("Spread miss");
     }
 
-    if (snapshots.empty())
-        return;
-
-    auto& [snapshot_player, model, eyePosition, bulletImpact, gotImpact, time, playerIndex, backtrackRecord] = snapshots.front();
-
-    Resolver::setup_detect(player, entity);
-    Resolver::resolve_entity(player, prev_player, entity);
-    Resolver::initialize(entity, player_record, original_goal_feet_yaw, original_pitch);
-    detect_jitter(player, entity);
+    snapshots.pop_front();
 }
 
-void Resolver::updateEventListeners(bool forceRemove) noexcept
-{
-    class ImpactEventListener : public GameEventListener {
+void Resolver::updateEventListeners(bool forceRemove) noexcept {
+    class ResolverEventListener : public GameEventListener {
     public:
-        void fireGameEvent(GameEvent* event) {
-            getEvent(event);
+        void fireGameEvent(GameEvent* event) override {
+            Resolver::processEvents(event);
         }
     };
 
-    static ImpactEventListener listener[4];
-    static bool listenerRegistered = false;
+    static ResolverEventListener listener;
+    static bool registered = false;
 
-    if (resolver && !listenerRegistered) {
-        interfaces->gameEventManager->addListener(&listener[0], skCrypt("bullet_impact"));
-        interfaces->gameEventManager->addListener(&listener[1], skCrypt("player_hurt"));
-        interfaces->gameEventManager->addListener(&listener[2], skCrypt("round_start"));
-        interfaces->gameEventManager->addListener(&listener[3], skCrypt("weapon_fire"));
-        listenerRegistered = true;
+    if (enabled && !registered && !forceRemove) {
+        interfaces->gameEventManager->addListener(&listener, "bullet_impact");
+        interfaces->gameEventManager->addListener(&listener, "player_hurt");
+        interfaces->gameEventManager->addListener(&listener, "round_start");
+        interfaces->gameEventManager->addListener(&listener, "weapon_fire");
+        registered = true;
     }
-
-    else if ((!resolver || forceRemove) && listenerRegistered) {
-        interfaces->gameEventManager->removeListener(&listener[0]);
-        interfaces->gameEventManager->removeListener(&listener[1]);
-        interfaces->gameEventManager->removeListener(&listener[2]);
-        interfaces->gameEventManager->removeListener(&listener[3]);
-        listenerRegistered = false;
+    else if ((!enabled || forceRemove) && registered) {
+        interfaces->gameEventManager->removeListener(&listener);
+        registered = false;
     }
-}
-
-float Resolver::resolve_pitch(Entity* entity)
-{
-    if (!(entity->flags() & FL_ONGROUND) && entity->eyeAngles().x >= 178.36304f)
-        pitch = -89.0f;
-    else
-    {
-        if (fabs(entity->eyeAngles().x) > 89.0f)
-            pitch = entity->index() % 4 != 3 ? 89.0f : -89.0f;
-        else if (entity->index() % 4 != 3)
-            pitch = 89.0f;
-    }
-
-    return original_pitch;
 }

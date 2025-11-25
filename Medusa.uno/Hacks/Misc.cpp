@@ -3758,8 +3758,8 @@ void Misc::infoInd() noexcept
         infotxt += " | HS";
 
     infotxt += " | TGT " + Ragebot::latest_player;
-    infotxt += " | HIT / MISS " + std::to_string(Resolver::hits) + "/" + std::to_string(Resolver::misses);
-    infotxt += " (" + std::to_string(Resolver::hit_rate) + "%)";
+    //infotxt += " | HIT / MISS " + std::to_string(Resolver::hits) + "/" + std::to_string(Resolver::misses);
+    //infotxt += " (" + std::to_string(Resolver::hit_rate) + "%)";
 
 
     ImGui::Begin(c_xor("##info"), NULL, ImGuiWindowFlags_::ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_::ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_::ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs);

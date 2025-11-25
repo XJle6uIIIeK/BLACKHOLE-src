@@ -23,11 +23,12 @@
 #include <iostream>
 #include <cstdlib>
 #include "../xor.h"
+#include "../Logger.h"
 
 static bool keyPressed = false;
 #define TICK_INTERVAL (memory->globalVars->currenttime)
 #define TIME_TO_TICKS(dt) ((int)(0.5f + (float)(dt) / TICK_INTERVAL))
-std::deque<adjust_data> player_records[65];
+//std::deque<adjust_data> player_records[65];
 
 void Ragebot::updateInput() noexcept
 {
@@ -727,7 +728,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
 
         for (size_t cycle = 0; cycle < 2; cycle++)
         {
-            auto update = player_records[cycle].empty() ||
+            /*auto update = player_records[cycle].empty() ||
                 entity->simulationTime() != entity->oldSimulationTime();
 
             if (update && !player_records[cycle].empty())
@@ -744,7 +745,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
                         update = false;
                     }
                 }
-            }
+            }*/
 
             float currentSimulationTime = -1.0f;
 
@@ -811,7 +812,7 @@ void Ragebot::run(UserCmd* cmd) noexcept
             }
 
             // Resolver
-            Resolver::resolve_shot(const_cast<Animations::Players&>(player), entity);
+            //Resolver::resolve_shot(const_cast<Animations::Players&>(player), entity);
 
             runRagebot(
                 cmd,
@@ -892,7 +893,9 @@ void Ragebot::run(UserCmd* cmd) noexcept
         {
             cmd->tickCount = timeToTicks(bestSimulationTime + Backtrack::getLerp());
 
-            Resolver::saveRecord(bestIndex, bestSimulationTime);
+            //Resolver::saveRecord(bestIndex, bestSimulationTime);
+            std::string debug = Resolver::getDebugInfo(bestIndex);
+            Logger::addLog(debug);
             Resolver::processMissedShots();
         }
 

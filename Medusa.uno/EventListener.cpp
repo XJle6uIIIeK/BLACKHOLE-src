@@ -55,7 +55,6 @@ void EventListener::fireGameEvent(GameEvent* event)
         GameData::clearProjectileList();
         Misc::preserveKillfeed(true);
         Misc::autoBuy(event);
-        Resolver::getEvent(event);
         Visuals::bulletTracer(event);
         [[fallthrough]];
     case fnv::hash("round_freeze_end"):
@@ -67,7 +66,6 @@ void EventListener::fireGameEvent(GameEvent* event)
         Misc::killfeedChanger(*event);
         Misc::killMessage(*event);
         Misc::killSound(*event);
-        Resolver::getEvent(event);
         break;
     case fnv::hash("player_hurt"):
         Misc::playHitSound(*event);
@@ -75,8 +73,7 @@ void EventListener::fireGameEvent(GameEvent* event)
         Visuals::hitEffect(event);
         Visuals::hitMarker(event);
         Visuals::dmgMarker(event);
-        Logger::getEvent(event);
-        Resolver::getEvent(event);
+        Logger::getEvent(event);;
         break;
     case fnv::hash("player_say"):
         Misc::chatRevealer(*event, event);

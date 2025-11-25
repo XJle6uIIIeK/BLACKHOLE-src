@@ -1,638 +1,398 @@
 #pragma once
-
-#include "Animations.h"
-
-#include "../SDK/GameEvent.h"
 #include "../SDK/Entity.h"
+#include "Animations.h"
+#include <array>
+#include <deque>
+#include <vector>
+#include <unordered_map>
 
-#define RAD2DEG(x) DirectX::XMConvertToDegrees(x)
-#define DEG2RAD(x) DirectX::XMConvertToRadians(x)
-
-//class adjust_data;
-enum resolver_side
-{
-	RESOLVER_ORIGINAL,
-	RESOLVER_ZERO,
-	RESOLVER_FIRST,
-	RESOLVER_SECOND,
-	RESOLVER_LOW_FIRST,
-	RESOLVER_LOW_SECOND,
-	RESOLVER_LOW_FIRST_20,
-	RESOLVER_LOW_SECOND_20,
-	RESOLVER_ON_SHOT,
-	RESOLVER_LOW_POSITIVE,
-	RESOLVER_LOW_NEGATIVE,
-	RESOLVER_POSITIVE,
-	RESOLVER_NEGATIVE,
-};
-enum resolver_history
-{
-	HISTORY_UNKNOWN = -1,
-	HISTORY_ORIGINAL,
-	HISTORY_ZERO,
-	HISTORY_DEFAULT,
-	HISTORY_LOW
-};
-enum resolver_type
-{
-	ORIGINAL,
-	BRUTEFORCE,
-	LBY,
-	LAYERS,
-	TRACE,
-	DIRECTIONAL,
-	ENGINE,
-	FREESTAND,
-	HURT,
-	NON_RESOLVED
-};
-
-enum Typpes
-{
-	JITTER,
-	STATIC
-};
-
-enum Mode
-{
-	AIR,
-	MOVING,
-	STANDING
-};
-
-enum JitterResolve
-{
-	JITTER1,
-	JITTER2,
-	NOPEE
-};
-
-enum ROTATE_MODE
-{
-	ROTATE_SERVER,
-	ROTATE_LEFT,
-	ROTATE_CENTER,
-	ROTATE_RIGHT,
-	ROTATE_LOW_LEFT,
-	ROTATE_LOW_RIGHT
-};
-
-enum simulate_side_t
-{
-	side_right = -1,
-	side_zero,
-	side_left,
-	side_original,
-};
-
-class ang_t {
+class Resolver {
 public:
-	// data member variables.
-	float x, y, z;
+    // ============================================
+    // ENUMS & CONSTANTS
+    // ============================================
 
-public:
-	// constructors.
-	__forceinline ang_t() : x{}, y{}, z{} {}
-	__forceinline ang_t(float x, float y, float z) : x{ x }, y{ y }, z{ z } {}
+    enum class ResolveMode {
+        NONE,
+        STANDING,
+        MOVING,
+        AIR,
+        SLOW_WALK
+    };
 
-	// at-accesors.
-	__forceinline float& at(const size_t index) {
-		return ((float*)this)[index];
-	}
+    enum class ResolveSide {
+        ORIGINAL = 0,
+        LEFT = -1,
+        RIGHT = 1
+    };
 
-	__forceinline float& at(const size_t index) const {
-		return ((float*)this)[index];
-	}
+    enum class ResolveMethod {
+        LBY,
+        ANIMSTATE,
+        POSE_PARAM,
+        TRACE,
+        BRUTEFORCE,
+        COUNT
+    };
 
-	// index operators.
-	__forceinline float& operator( )(const size_t index) {
-		return at(index);
-	}
+    // Pose parameter indices (CS:GO specific)
+    enum PoseParameters {
+        LEAN_YAW = 0,
+        SPEED = 1,
+        LADDER_SPEED = 2,
+        LADDER_YAW = 3,
+        MOVE_YAW = 4,
+        RUN = 5,
+        BODY_YAW = 6,
+        BODY_PITCH = 7,
+        DEATH_YAW = 8,
+        STAND = 9,
+        JUMP_FALL = 10,
+        AIM_BLEND_STAND_IDLE = 11,
+        AIM_BLEND_CROUCH_IDLE = 12,
+        STRAFE_DIR = 13,
+        AIM_BLEND_STAND_WALK = 14,
+        AIM_BLEND_STAND_RUN = 15,
+        AIM_BLEND_CROUCH_WALK = 16,
+        MOVE_BLEND_WALK = 17,
+        MOVE_BLEND_RUN = 18,
+        MOVE_BLEND_CROUCH_WALK = 19,
+        AIM_MATRIX = 20,
+        POSE_PARAM_COUNT = 24
+    };
 
-	__forceinline const float& operator( )(const size_t index) const {
-		return at(index);
-	}
+    // ============================================
+    // STRUCTURES
+    // ============================================
 
-	__forceinline float& operator[ ](const size_t index) {
-		return at(index);
-	}
+    struct MethodVote {
+        ResolveMethod method;
+        ResolveSide side;
+        float confidence;      // 0.0 - 1.0
+        float suggested_yaw;   // Suggested absolute yaw
+        bool valid;
 
-	__forceinline const float& operator[ ](const size_t index) const {
-		return at(index);
-	}
+        MethodVote() : method(ResolveMethod::LBY), side(ResolveSide::ORIGINAL),
+            confidence(0.f), suggested_yaw(0.f), valid(false) {
+        }
+    };
 
-	// equality operators.
-	__forceinline bool operator==(const ang_t& v) const {
-		return v.x == x && v.y == y && v.z == z;
-	}
+    struct LBYData {
+        float current_lby = 0.f;
+        float last_lby = 0.f;
+        float last_moving_lby = 0.f;
+        float lby_delta = 0.f;
+        float last_update_time = 0.f;
+        float next_update_time = 0.f;
+        float standing_time = 0.f;
+        int flick_count = 0;
+        bool updated_this_tick = false;
+        bool is_flicking = false;
 
-	__forceinline bool operator!=(const ang_t& v) const {
-		return v.x != x || v.y != y || v.z != z;
-	}
+        std::array<float, 32> lby_history{};
+        int history_index = 0;
 
-	__forceinline bool operator !() const {
-		return !x && !y && !z;
-	}
+        void reset() {
+            current_lby = 0.f;
+            last_lby = 0.f;
+            last_moving_lby = 0.f;
+            lby_delta = 0.f;
+            last_update_time = 0.f;
+            next_update_time = 0.f;
+            standing_time = 0.f;
+            flick_count = 0;
+            updated_this_tick = false;
+            is_flicking = false;
+            lby_history.fill(0.f);
+            history_index = 0;
+        }
+    };
 
-	// copy assignment.
-	__forceinline ang_t& operator=(const ang_t& v) {
-		x = v.x;
-		y = v.y;
-		z = v.z;
+    struct AnimStateData {
+        float foot_yaw = 0.f;
+        float last_foot_yaw = 0.f;
+        float goal_feet_yaw = 0.f;
+        float eye_yaw = 0.f;
+        float move_yaw = 0.f;
+        float move_yaw_ideal = 0.f;
+        float move_yaw_current = 0.f;
+        float duck_amount = 0.f;
+        float velocity_length = 0.f;
 
-		return *this;
-	}
+        std::array<AnimationLayer, 13> layers{};
+        std::array<AnimationLayer, 13> prev_layers{};
 
-	// negation-operator.
-	__forceinline ang_t operator-() const {
-		return ang_t(-x, -y, -z);
-	}
+        // Layer deltas for comparison
+        struct LayerDelta {
+            float weight_delta = 0.f;
+            float cycle_delta = 0.f;
+            float rate_delta = 0.f;
+        };
+        std::array<LayerDelta, 13> layer_deltas{};
 
-	// arithmetic operators.
-	__forceinline ang_t operator+(const ang_t& v) const {
-		return {
-			x + v.x,
-			y + v.y,
-			z + v.z
-		};
-	}
+        void reset() {
+            foot_yaw = 0.f;
+            last_foot_yaw = 0.f;
+            goal_feet_yaw = 0.f;
+            eye_yaw = 0.f;
+            move_yaw = 0.f;
+            move_yaw_ideal = 0.f;
+            move_yaw_current = 0.f;
+            duck_amount = 0.f;
+            velocity_length = 0.f;
+        }
+    };
 
-	__forceinline ang_t operator-(const ang_t& v) const {
-		return {
-			x - v.x,
-			y - v.y,
-			z - v.z
-		};
-	}
+    struct PoseParamData {
+        std::array<float, POSE_PARAM_COUNT> current{};
+        std::array<float, POSE_PARAM_COUNT> previous{};
+        std::array<float, POSE_PARAM_COUNT> deltas{};
 
-	__forceinline ang_t operator*(const ang_t& v) const {
-		return {
-			x * v.x,
-			y * v.y,
-			z * v.z
-		};
-	}
+        // Simulated pose params for left/right/center
+        std::array<float, POSE_PARAM_COUNT> simulated_left{};
+        std::array<float, POSE_PARAM_COUNT> simulated_right{};
+        std::array<float, POSE_PARAM_COUNT> simulated_center{};
 
-	__forceinline ang_t operator/(const ang_t& v) const {
-		return {
-			x / v.x,
-			y / v.y,
-			z / v.z
-		};
-	}
+        float body_yaw = 0.f;
+        float lean_yaw = 0.f;
+        float move_yaw = 0.f;
 
-	// compound assignment operators.
-	__forceinline ang_t& operator+=(const ang_t& v) {
-		x += v.x;
-		y += v.y;
-		z += v.z;
-		return *this;
-	}
+        void reset() {
+            current.fill(0.f);
+            previous.fill(0.f);
+            deltas.fill(0.f);
+            simulated_left.fill(0.f);
+            simulated_right.fill(0.f);
+            simulated_center.fill(0.f);
+            body_yaw = 0.f;
+            lean_yaw = 0.f;
+            move_yaw = 0.f;
+        }
+    };
 
-	__forceinline ang_t& operator-=(const ang_t& v) {
-		x -= v.x;
-		y -= v.y;
-		z -= v.z;
-		return *this;
-	}
+    struct JitterData {
+        std::array<float, 32> yaw_history{};
+        int history_index = 0;
+        int jitter_ticks = 0;
+        int static_ticks = 0;
+        float average_yaw = 0.f;
+        float yaw_variance = 0.f;
+        bool is_jittering = false;
+        int jitter_side = 0; // For jitter pattern tracking
 
-	__forceinline ang_t& operator*=(const ang_t& v) {
-		x *= v.x;
-		y *= v.y;
-		z *= v.z;
-		return *this;
-	}
+        void reset() {
+            yaw_history.fill(0.f);
+            history_index = 0;
+            jitter_ticks = 0;
+            static_ticks = 0;
+            average_yaw = 0.f;
+            yaw_variance = 0.f;
+            is_jittering = false;
+            jitter_side = 0;
+        }
+    };
 
-	__forceinline ang_t& operator/=(const ang_t& v) {
-		x /= v.x;
-		y /= v.y;
-		z /= v.z;
-		return *this;
-	}
+    struct ResolverData {
+        // Final resolved data
+        ResolveSide side = ResolveSide::ORIGINAL;
+        ResolveMode mode = ResolveMode::NONE;
+        float resolved_yaw = 0.f;
+        float confidence = 0.f;
 
-	// arithmetic operators w/ float.
-	__forceinline ang_t operator+(float f) const {
-		return {
-			x + f,
-			y + f,
-			z + f
-		};
-	}
+        // Method-specific data
+        LBYData lby;
+        AnimStateData animstate;
+        PoseParamData pose;
+        JitterData jitter;
 
-	__forceinline ang_t operator-(float f) const {
-		return {
-			x - f,
-			y - f,
-			z - f
-		};
-	}
+        // Voting results
+        std::array<MethodVote, static_cast<int>(ResolveMethod::COUNT)> votes{};
+        ResolveMethod winning_method = ResolveMethod::LBY;
 
-	__forceinline ang_t operator*(float f) const {
-		return {
-			x * f,
-			y * f,
-			z * f
-		};
-	}
+        // Statistics
+        int misses = 0;
+        int hits = 0;
+        int total_shots = 0;
 
-	__forceinline ang_t operator/(float f) const {
-		return {
-			x / f,
-			y / f,
-			z / f
-		};
-	}
+        // State flags
+        bool is_low_delta = false;
+        bool is_faking = false;
+        bool is_moving = false;
+        bool is_on_ground = false;
+        bool extended_desync = false;
 
-	// compound assignment operators w/ float.
-	__forceinline ang_t& operator+=(float f) {
-		x += f;
-		y += f;
-		z += f;
-		return *this;
-	}
+        // Timing
+        float last_resolve_time = 0.f;
+        float last_moving_time = 0.f;
 
-	__forceinline ang_t& operator-=(float f) {
-		x -= f;
-		y -= f;
-		z -= f;
-		return *this;
-	}
+        // Eye angles history
+        std::array<Vector, 16> eye_angles_history{};
+        int eye_angles_index = 0;
 
-	__forceinline ang_t& operator*=(float f) {
-		x *= f;
-		y *= f;
-		z *= f;
-		return *this;
-	}
+        void reset() {
+            side = ResolveSide::ORIGINAL;
+            mode = ResolveMode::NONE;
+            resolved_yaw = 0.f;
+            confidence = 0.f;
+            lby.reset();
+            animstate.reset();
+            pose.reset();
+            jitter.reset();
+            for (auto& v : votes) v = MethodVote();
+            winning_method = ResolveMethod::LBY;
+            misses = 0;
+            hits = 0;
+            total_shots = 0;
+            is_low_delta = false;
+            is_faking = false;
+            is_moving = false;
+            is_on_ground = false;
+            extended_desync = false;
+            last_resolve_time = 0.f;
+            last_moving_time = 0.f;
+            eye_angles_history.fill(Vector{});
+            eye_angles_index = 0;
+        }
+    };
 
-	__forceinline ang_t& operator/=(float f) {
-		x /= f;
-		y /= f;
-		z /= f;
-		return *this;
-	}
+    struct ShotSnapshot {
+        int player_index = -1;
+        int backtrack_tick = -1;
+        Vector eye_position{};
+        Vector impact_position{};
+        float time = -1.f;
+        bool got_impact = false;
+        matrix3x4 matrix[256]{};
+        const Model* model = nullptr;
+        ResolverData resolver_state; // Store resolver state at shot time
+    };
 
-	// methods.
-	__forceinline void clear() {
-		x = y = z = 0.f;
-	}
+    // ============================================
+    // PUBLIC METHODS
+    // ============================================
 
+    static void initialize() noexcept;
+    static void reset() noexcept;
+    static void update(Entity* entity, Animations::Players& player) noexcept;
+
+    // Event handling
+    static void processEvents(GameEvent* event) noexcept;
+
+    // Shot tracking
+    static void saveShot(int playerIndex, float simTime, int backtrackTick = -1) noexcept;
+    static void processMissedShots() noexcept;
+
+    // Event listeners
+    static void updateEventListeners(bool forceRemove = false) noexcept;
+
+    // Getters
+    static const ResolverData& getData(int index) noexcept { return data[index]; }
+    static bool isEnabled() noexcept { return enabled; }
+    static void setEnabled(bool value) noexcept { enabled = value; }
+
+    // Debug info
+    static std::string getDebugInfo(int index) noexcept;
+    static std::string getMethodName(ResolveMethod method) noexcept;
+
+private:
+    // ============================================
+    // CORE RESOLVE METHODS
+    // ============================================
+
+    // Main voting system
+    static void collectVotes(Entity* entity, ResolverData& info) noexcept;
+    static void processVotes(Entity* entity, ResolverData& info) noexcept;
+    static float calculateFinalYaw(Entity* entity, ResolverData& info) noexcept;
+
+    // Individual resolvers
+    static MethodVote resolveLBY(Entity* entity, ResolverData& info) noexcept;
+    static MethodVote resolveAnimState(Entity* entity, ResolverData& info) noexcept;
+    static MethodVote resolvePoseParams(Entity* entity, ResolverData& info) noexcept;
+    static MethodVote resolveTrace(Entity* entity, ResolverData& info) noexcept;
+    static MethodVote resolveBruteforce(Entity* entity, ResolverData& info) noexcept;
+
+    // ============================================
+    // LBY RESOLVER
+    // ============================================
+
+    static void updateLBYData(Entity* entity, ResolverData& info) noexcept;
+    static bool predictLBYUpdate(Entity* entity, ResolverData& info) noexcept;
+    static float getLBYUpdateTime(Entity* entity, ResolverData& info) noexcept;
+    static bool detectLBYFlick(Entity* entity, ResolverData& info) noexcept;
+    static ResolveSide getLBYSide(Entity* entity, ResolverData& info) noexcept;
+
+    // ============================================
+    // ANIMSTATE RESOLVER
+    // ============================================
+
+    static void updateAnimStateData(Entity* entity, ResolverData& info) noexcept;
+    static void simulateAnimState(Entity* entity, ResolverData& info, float yaw) noexcept;
+    static float compareAnimLayers(Entity* entity, ResolverData& info) noexcept;
+    static ResolveSide getAnimStateSide(Entity* entity, ResolverData& info) noexcept;
+    static float getMoveYaw(Entity* entity, ResolverData& info) noexcept;
+    static bool detectExtendedDesync(Entity* entity, ResolverData& info) noexcept;
+
+    // ============================================
+    // POSE PARAMETER RESOLVER
+    // ============================================
+
+    static void updatePoseParamData(Entity* entity, ResolverData& info) noexcept;
+    static void simulatePoseParams(Entity* entity, ResolverData& info, float yaw,
+        std::array<float, POSE_PARAM_COUNT>& out) noexcept;
+    static float comparePoseParams(const std::array<float, POSE_PARAM_COUNT>& a,
+        const std::array<float, POSE_PARAM_COUNT>& b) noexcept;
+    static ResolveSide getPoseParamSide(Entity* entity, ResolverData& info) noexcept;
+    static float extractBodyYawFromPose(Entity* entity, ResolverData& info) noexcept;
+
+    // ============================================
+    // DETECTION METHODS
+    // ============================================
+
+    static ResolveMode detectMode(Entity* entity, ResolverData& info) noexcept;
+    static bool detectJitter(Entity* entity, ResolverData& info) noexcept;
+    static bool detectLowDelta(Entity* entity, ResolverData& info) noexcept;
+    static bool detectFakeAngles(Entity* entity) noexcept;
+    static bool detectFakeWalk(Entity* entity, ResolverData& info) noexcept;
+
+    // ============================================
+    // UTILITY METHODS
+    // ============================================
+
+    static float getMaxDesync(Entity* entity) noexcept;
+    static float buildServerAbsYaw(Entity* entity, float yaw) noexcept;
+    static float getAtTargetYaw(Entity* entity) noexcept;
+    static float normalizeYaw(float yaw) noexcept;
+    static float angleDiff(float a, float b) noexcept;
+    static float approachAngle(float target, float value, float speed) noexcept;
+
+    // Weight calculations for voting
+    static float getMethodWeight(ResolveMethod method, ResolverData& info) noexcept;
+    static float calculateConfidence(Entity* entity, ResolverData& info, MethodVote& vote) noexcept;
+
+    // ============================================
+    // DATA
+    // ============================================
+
+    static inline std::array<ResolverData, 65> data{};
+    static inline std::deque<ShotSnapshot> snapshots{};
+    static inline bool enabled = true;
+
+    // ============================================
+    // CONSTANTS
+    // ============================================
+
+    static constexpr float LBY_UPDATE_TIME = 1.1f;
+    static constexpr float JITTER_THRESHOLD = 15.f;
+    static constexpr float LOW_DELTA_THRESHOLD = 35.f;
+    static constexpr float MOVING_SPEED_THRESHOLD = 0.1f;
+    static constexpr float FAKE_WALK_THRESHOLD = 52.f;
+    static constexpr int MAX_SNAPSHOTS = 32;
+    static constexpr int HISTORY_SIZE = 32;
+
+    // Method weights (can be adjusted)
+    static constexpr float WEIGHT_LBY = 1.0f;
+    static constexpr float WEIGHT_ANIMSTATE = 1.2f;
+    static constexpr float WEIGHT_POSE = 1.1f;
+    static constexpr float WEIGHT_TRACE = 0.8f;
+    static constexpr float WEIGHT_BRUTE = 0.5f;
 };
-
-class AimPlayer {
-
-public:
-
-	// netvars.
-	float  m_sim_time;
-	Vector m_origin;
-	float  m_body;
-	float  m_anim_time;
-};
-
-class adjust_data //-V730
-{
-public:
-	std::array< AimPlayer, 64 > m_players;
-	AimPlayer m_walk_record1;
-	AnimationLayer layers[13];
-	bool player_records[65];
-	resolver_type type;
-	resolver_side side;
-	JitterResolve Jitter;
-	Mode Modes;
-	Typpes Types;
-	float Right;
-	float Middle;
-	float Left;
-	float desync_amount;
-	Player* player;
-	bool m_valid{ false };
-	AnimationLayer resolver_layers[3][13];
-	bool is_jittering{};
-
-	// get current desync angle
-	float m_dsyangle{ 0.f };
-
-	// side applied to angle
-	int m_side{ 0 };
-
-	// set roll angle
-	bool m_roll{ false };
-
-	// layers before animfix start (used for calculations)
-	AnimationLayer m_layers[13]{};
-	AnimationLayer m_layer[13]{};
-
-	// did we find layer ?
-	bool m_layer_init{ false };
-
-	// side applied in resolver modes
-	int m_curside{ 0 };
-	int m_lastside{ 0 };
-
-	// did we apply history resolver ?
-	bool m_history{ false };
-
-	// current resolver mode:
-// 1 - freestanding
-// 2 - animations
-// 3 - brute
-// 4 - brute Z
-	int m_mode{ 0 };
-
-	bool invalid;
-	Vector origin;
-	float simulation_time;
-	bool shot;
-
-	float duck_amount;
-
-	Vector velocity;
-	bool resolved{};
-
-	bool   m_fake_walk;
-	float  m_body;
-	int       m_body_index;
-	bool      m_has_body_updated;
-	int       m_last_moving_index;
-	int		  m_stand_index;
-	int		  m_stand_index1;
-	int       m_stand_index3;
-	int       m_reverse_fs;
-	int		  m_last_move;
-	int    m_flags;
-	int m_walk_record;
-	Vector m_velocity;
-	int       m_shots;
-	Vector m_pred_origin;
-	Vector           m_anim_velocity;
-	int     m_lag;
-	bool   m_shot;
-	ang_t  m_eye_angles;
-	Vector vecEyeAngles{};
-	using records_t = std::deque< std::shared_ptr< adjust_data > >;
-	records_t m_records;
-
-	struct jitter_t
-	{
-		bool is_jitter{};
-
-		float delta_cache[2]{};
-		int cache_offset{};
-
-		float yaw_cache[20]{};
-		int yaw_cache_offset{};
-
-		int jitter_ticks{};
-		int static_ticks{};
-
-		int jitter_tick{};
-
-		__forceinline void reset()
-		{
-			is_jitter = false;
-
-			cache_offset = 0;
-			yaw_cache_offset = 0;
-
-			jitter_ticks = 0;
-			static_ticks = 0;
-
-			jitter_tick = 0;
-
-			std::memset(delta_cache, 0, sizeof(delta_cache));
-			std::memset(yaw_cache, 0, sizeof(yaw_cache));
-		}
-	} jitter;
-
-	bool    m_dormant;
-	__forceinline bool dormant() {
-		return m_dormant;
-	}
-	Vector m_origin;
-	bool      m_moved;
-	float     m_best_angle;
-	float  m_anim_time;
-
-	int iResolveSide = 0;
-	float flResolveDelta{};
-};
-
-enum EMatrixType : int {
-
-	VISUAL,
-	RESOLVE,
-	LEFT,
-	RIGHT,
-	CENTER,
-	MAX
-};
-
-namespace Resolver
-{
-	inline int hits{};
-	inline int misses{};
-	inline int hit_rate{};
-
-	Entity* player = nullptr;
-	adjust_data* player_record = nullptr;
-	int ResolveSide[64];
-	bool side = false;
-	bool fake = false;
-	bool was_first_bruteforce = false;
-	bool was_second_bruteforce = false;
-	float original_goal_feet_yaw = 0.0f;
-	float original_pitch = 0.0f;
-	int jitter_side;
-	bool updating_animation;
-	int ResolverSide;
-	bool brutforced_first = false;
-	bool brutforced_second = false;
-	int missed_shots[65];
-	float desynclog[65];
-	int FreestandSide[65];
-	float desync_angle = 0.0f;
-	bool should_force_safepoint = false;
-	float desync = 0.0f;
-	float pitch = FLT_MAX;
-	bool bDidShot{};
-
-	// resolver stuff.
-	size_t m_mode;
-
-	void reset();
-
-	inline adjust_data resolver_info[65]{};
-
-	float max_desync_delta(Entity* player);
-
-	bool DoesHaveJitter(Entity* player);
-
-	resolver_side last_side = RESOLVER_ORIGINAL;
-
-	void MovingLayers();
-
-	void StoreAntifreestand();
-
-	void ResolveStand();
-
-	void ApplyAngle(Entity* entity);
-
-	bool DoesHaveFakeAngles(Entity* entity);
-
-	bool GetLowDeltaState(Entity* entity);
-
-	void ResolveAir();
-
-	void ResolveJitter();
-
-	void detect_jitter(Animations::Players player, Entity* entity) noexcept;
-
-	float BruteForce(Entity* entity, bool roll);
-
-	int detect_freestanding(Entity* entity);
-
-	float GetAwayAngle(adjust_data* record);
-
-	bool IsYawSideways(Entity* entity, float yaw);
-
-	void ResolveAir1(adjust_data* data, Entity* entity);
-
-	void ResolveWalk(adjust_data* data, Entity* entity);
-
-	void SetMode(adjust_data* record);
-
-	void MatchShot(adjust_data* data, Entity* entity);
-
-
-	void resolve_entity(Animations::Players& player, Animations::Players prev_player, Entity* entity);
-
-	float resolve_shot(const Animations::Players& player, Entity* entity);
-
-	void setup_detect(Animations::Players& player, Entity* entity);
-
-	void UpdateShots(UserCmd* cmd) noexcept;
-
-	void processMissedShots() noexcept;
-	void runPreUpdate(Animations::Players player, Animations::Players prev_player, Entity* entity) noexcept;
-	void runPostUpdate(Animations::Players player, Animations::Players prev_player, Entity* entity) noexcept;
-	void initialize(Entity* e, adjust_data* record, const float& goal_feet_yaw, const float& pitch);
-	void CmdGrabber(UserCmd* cmd1);
-	void saveRecord(int playerIndex, float playerSimulationTime) noexcept;
-
-	void getEvent(GameEvent* event) noexcept;
-
-	float GetLeftYaw(Entity* entity);
-
-	float GetRightYaw(Entity* entity);
-
-
-	void apply_side(Entity* entity, const int& choke);
-
-	void Antionetap(int userid, Entity* entity, Vector shot);
-
-	void detect_side(Entity* entity, int* side);
-
-	void delta_side_detect(int* side, Entity* entity);
-
-	void updateEventListeners(bool forceRemove = false) noexcept;
-
-	float resolve_pitch(Entity* entity);
-
-	struct player_settings
-	{
-		__int64 id;
-		resolver_history res_type;
-		bool low_stand;
-		bool low_move;
-		bool faking;
-		int neg;
-		int pos;
-
-		player_settings(__int64 id, resolver_history res_type, bool low_stand, bool low_move, bool faking, int left, int right) noexcept : id(id), res_type(res_type), low_stand(low_stand), low_move(low_move), faking(faking), neg(neg), pos(pos)
-		{
-
-		}
-	};
-	std::vector<player_settings> player_sets;
-
-	enum Modes : size_t {
-		RESOLVE_NONE = 0,
-		RESOLVE_WALK,
-		RESOLVE_STAND1,//not sideways hopefully
-		RESOLVE_STAND2,//sideways praying brute
-		RESOLVE_STAND3,//unknown last move
-		RESOLVE_REVERSEFS,
-		RESOLVE_LASTMOVELBY,
-		RESOLVE_BACK,
-		RESOLVE_AIR,
-		RESOLVE_BODY,
-		RESOLVE_BODY_UPDATED,
-		RESOLVE_STAND//default
-	};
-
-	struct Tick
-	{
-		matrix3x4 matrix[256];
-		Vector origin;
-		Vector mins;
-		Vector max;
-		float time;
-	};
-
-	struct Ticks
-	{
-		Vector position;
-		float time;
-	};
-
-	struct Info
-	{
-		Info() : misses(0), hit(false) {}
-		int misses;
-		bool hit;
-	};
-
-
-	extern std::deque<Ticks> bulletImpacts;
-	extern std::deque<Ticks> tick;
-	extern std::deque<Tick> shot[65];
-	inline std::array<adjust_data, 65> m_info{ };
-	inline std::array<std::vector<adjust_data>, 65> m_history{ };
-
-	struct SnapShot
-	{
-		Animations::Players player;
-		const Model* model{ };
-		Vector eyePosition{};
-		Vector bulletImpact{};
-		bool gotImpact{ false };
-		float time{ -1 };
-		int playerIndex{ -1 };
-		int backtrackRecord{ -1 };
-	};
-
-	Resolver::Ticks getClosest(const float time) noexcept;
-}
-
-class AdaptiveAngle {
-public:
-	float m_yaw;
-	float m_dist;
-
-public:
-	// ctor.
-	__forceinline AdaptiveAngle(float yaw, float penalty = 0.f) {
-		// set yaw.
-		m_yaw = Helpers::normalizeYaw(yaw);
-
-		// init distance.
-		m_dist = 0.f;
-
-		// remove penalty.
-		m_dist -= penalty;
-	}
-};
-
-extern std::string ResolverMode[65];
