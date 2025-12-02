@@ -61,7 +61,7 @@ public:
         bool forceSafePoints{ false };
         bool unsafeHitbox{ false };
         bool delayShot{ true };
-        int delayShotTicks{ 3 };
+        int delayShotTicks{ 5 };
     };
     std::array<Ragebot, 11> rageBot;
     struct LegitbotGlobal {
@@ -174,7 +174,6 @@ public:
         KeyBind doubletap{ std::string("Double Tap"), KeyMode::Off };
         KeyBind hideshots{ std::string("Hide Shots"), KeyMode::Off };
         bool teleport{ false };
-        bool fast_recharge{ false };
         bool defensive_dt{ false };
     } tickbase;
     KeyBind legitbotKey{ std::string("Legitbot") };

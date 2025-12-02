@@ -23,6 +23,7 @@
 #include <cmath>
 #include "../xor.h"
 #include "../Logger.h"
+#include "../VectorSIMD.h"
 
 #define TICK_INTERVAL (memory->globalVars->intervalPerTick)
 #define TIME_TO_TICKS(dt) ((int)(0.5f + (float)(dt) / TICK_INTERVAL))
@@ -326,11 +327,24 @@ std::vector<Ragebot::HitboxPriority> Ragebot::calculateHitboxPriorities(
         }
     }
 
-    // Sort by priority
-    std::sort(priorities.begin(), priorities.end(),
-        [](const HitboxPriority& a, const HitboxPriority& b) {
-            return a.basePriority > b.basePriority;
-        });
+ 
+    constexpr size_t TOP_HITBOXES = 5;
+
+    if (priorities.size() > TOP_HITBOXES) {
+        std::partial_sort(priorities.begin(),
+            priorities.begin() + TOP_HITBOXES,
+            priorities.end(),
+            [](const HitboxPriority& a, const HitboxPriority& b) {
+                return a.basePriority > b.basePriority;
+            });
+        priorities.resize(TOP_HITBOXES);
+    }
+    else {
+        std::sort(priorities.begin(), priorities.end(),
+            [](const HitboxPriority& a, const HitboxPriority& b) {
+                return a.basePriority > b.basePriority;
+            });
+    }
 
     return priorities;
 }
@@ -567,10 +581,36 @@ std::vector<Ragebot::AimPoint> Ragebot::generateAimPoints(
     if (!weaponData)
         return points;
 
+    float distance = VectorSIMD::distanceFast(localPlayer->getAbsOrigin(), entity->getAbsOrigin());
+
+    // Уменьшаем количество точек для дальних целей
+    float distanceScale = 1.0f;
+    if (distance > 3000.f) { // > 75м
+        distanceScale = 0.5f; // 50% точек
+    }
+    else if (distance > 2000.f) { // > 50м
+        distanceScale = 0.75f; // 75% точек
+    }
+
+    int adjustedMPHead = static_cast<int>(multiPointHead * distanceScale);
+    int adjustedMPBody = static_cast<int>(multiPointBody * distanceScale);
+
+    // Минимум 1 точка (центр хитбокса)
+    adjustedMPHead = (std::max)(1, adjustedMPHead);
+    adjustedMPBody = (std::max)(1, adjustedMPBody);
+
+
+    constexpr int MAX_TOTAL_POINTS = 64;
+    int totalPointsGenerated = 0;
+
     // Get hitbox priorities
     auto priorities = calculateHitboxPriorities(entity, weapon, minDamage, weaponIndex);
 
     for (const auto& hp : priorities) {
+        if (totalPointsGenerated >= MAX_TOTAL_POINTS) {
+            break;
+        }
+
         if (!enabledHitboxes[hp.hitbox])
             continue;
 
@@ -578,17 +618,22 @@ std::vector<Ragebot::AimPoint> Ragebot::generateAimPoints(
         if (!bbox)
             continue;
 
-        // Get multipoint scale based on hitbox type
-        int mpScale = (hp.hitbox == Hitboxes::Head) ? multiPointHead : multiPointBody;
+
+        int mpScale = (hp.hitbox == Hitboxes::Head) ? adjustedMPHead : adjustedMPBody;
 
         // Generate points for this hitbox
         auto hitboxPoints = AimbotFunction::multiPoint(entity, matrix, bbox, eyePos,
-            hp.hitbox, multiPointHead, multiPointBody);
+            hp.hitbox, adjustedMPHead, adjustedMPBody);
+
+        int maxPointsFromHitbox = (std::min)(static_cast<int>(hitboxPoints.size()),
+            MAX_TOTAL_POINTS - totalPointsGenerated);
 
         // Get safe points for comparison
         auto safePointsList = getSafePoints(entity, hp.hitbox, matrix, set, eyePos);
 
-        for (const auto& pos : hitboxPoints) {
+        for (int idx = 0; idx < maxPointsFromHitbox; idx++) {
+            const auto& pos = hitboxPoints[idx];
+
             AimPoint ap;
             ap.position = pos;
             ap.hitbox = hp.hitbox;
@@ -603,17 +648,16 @@ std::vector<Ragebot::AimPoint> Ragebot::generateAimPoints(
 
             // Check if this is a safe point
             ap.isSafe = isSafePoint(entity, pos, hp.hitbox, matrix, set);
-            ap.isMultipoint = (pos != hitboxPoints[0]); // First point is usually center
+            ap.isMultipoint = (idx > 0); // Первая точка - центр
 
             // Calculate distance from center
             if (!safePointsList.empty()) {
-                ap.distanceFromCenter = pos.distTo(safePointsList[0]);
+                ap.distanceFromCenter = VectorSIMD::distanceFast(pos, safePointsList[0]);
             }
             else {
                 ap.distanceFromCenter = 0.f;
             }
 
-            // Calculate hitchance (simplified - full check done later)
             ap.hitchance = 0.f; // Will be calculated properly later
 
             // Calculate priority
@@ -621,13 +665,19 @@ std::vector<Ragebot::AimPoint> Ragebot::generateAimPoints(
                 cfg1.preferSafePoints);
 
             points.push_back(ap);
+            totalPointsGenerated++;
         }
 
-        // === НОВОЕ: Unsafe Hitbox - добавляем edge points для сложных AA ===
-        if (cfg1.unsafeHitbox) {
+        // Unsafe hitbox points
+        if (cfg1.unsafeHitbox && totalPointsGenerated < MAX_TOTAL_POINTS) {
             auto unsafePointsList = getUnsafePoints(entity, hp.hitbox, matrix, set, eyePos);
 
-            for (const auto& pos : unsafePointsList) {
+            int maxUnsafe = (std::min)(static_cast<int>(unsafePointsList.size()),
+                MAX_TOTAL_POINTS - totalPointsGenerated);
+
+            for (int idx = 0; idx < maxUnsafe; idx++) {
+                const auto& pos = unsafePointsList[idx];
+
                 AimPoint ap;
                 ap.position = pos;
                 ap.hitbox = hp.hitbox;
@@ -648,12 +698,23 @@ std::vector<Ragebot::AimPoint> Ragebot::generateAimPoints(
                 ap.priority = calculatePointPriority(ap, weaponIndex, entity->health(), false) * 0.7f;
 
                 points.push_back(ap);
+                totalPointsGenerated++;
             }
         }
     }
 
-    // Sort by priority
-    std::sort(points.begin(), points.end());
+    // Нам нужны только топ-10 лучших точек
+    constexpr int TOP_POINTS = 10;
+    if (points.size() > TOP_POINTS) {
+        std::partial_sort(points.begin(), points.begin() + TOP_POINTS, points.end(),
+            [](const AimPoint& a, const AimPoint& b) {
+                return a.priority > b.priority;
+            });
+        points.resize(TOP_POINTS); // Отбрасываем остальные
+    }
+    else {
+        std::sort(points.begin(), points.end());
+    }
 
     return points;
 }
@@ -855,7 +916,13 @@ std::vector<Ragebot::TargetData> Ragebot::collectTargets(UserCmd* cmd, Entity* w
 
     const auto& localPlayerOrigin = localPlayer->getAbsOrigin();
 
+    bool foundPerfectShot = false;
+
     for (int i = 1; i <= interfaces->engine->getMaxClients(); ++i) {
+        if (foundPerfectShot && !targets.empty()) {
+            break;
+        }
+
         const auto player = Animations::getPlayer(i);
         if (!player.gotMatrix)
             continue;
@@ -882,33 +949,23 @@ std::vector<Ragebot::TargetData> Ragebot::collectTargets(UserCmd* cmd, Entity* w
         if (!set)
             continue;
 
-
-
         TargetData targetData;
         targetData.entity = entity;
         targetData.index = i;
         targetData.health = entity->health();
-        targetData.distance = localPlayerOrigin.distTo(entity->getAbsOrigin());
+        targetData.distance = VectorSIMD::distanceFast(localPlayerOrigin, entity->getAbsOrigin());
+
+
+        if (targetData.distance > 6000.f) {
+            continue;
+        }
 
         const auto angle = AimbotFunction::calculateRelativeAngle(eyePos,
             player.matrix[8].origin(), cmd->viewangles + aimPunch);
         targetData.fov = angle.length2D();
 
-        // ✅ Пропусти слишком далёких врагов
-        if (targetData.distance > 4000.f)  // ~100 метров
-            continue;
-
         if (targetData.fov > cfg.fov)
             continue;
-
-        if (!targets.empty()) {
-            const auto& best = targets.back();
-            if (best.hasValidPoint &&
-                best.bestPoint.damage >= best.health &&
-                best.bestPoint.hitchance >= 95.f) {
-                return targets;  // Идеальный выстрел найден!
-            }
-        }
 
         // Setup hitboxes
         std::array<bool, Hitboxes::Max> hitboxes{ false };
@@ -1016,6 +1073,20 @@ std::vector<Ragebot::TargetData> Ragebot::collectTargets(UserCmd* cmd, Entity* w
                 targetData.simulationTime = currentSimulationTime;
                 targetData.isBacktrack = isBacktrack;
                 targetData.backtrackTick = backtrackTick;
+
+                bool isLethalShot = targetData.bestPoint.damage >= targetData.health;
+                bool isHighConfidence = targetData.bestPoint.hitchance >= 95.f;
+                bool isSafeShot = targetData.bestPoint.isSafe || !cfg1.preferSafePoints;
+
+                if (isLethalShot && isHighConfidence && isSafeShot) {
+                    resetMatrix(entity, backupBoneCache, backupOrigin, backupAbsAngle,
+                        backupMins, backupMaxs);
+
+                    targets.clear(); 
+                    targets.push_back(targetData);
+                    foundPerfectShot = true;
+                    break;
+                }
             }
 
             resetMatrix(entity, backupBoneCache, backupOrigin, backupAbsAngle,
@@ -1025,13 +1096,18 @@ std::vector<Ragebot::TargetData> Ragebot::collectTargets(UserCmd* cmd, Entity* w
                 break;
         }
 
-        if (targetData.hasValidPoint || !targets.empty()) {
+        if (targetData.hasValidPoint) {
             targets.push_back(targetData);
+        }
+
+        if (foundPerfectShot) {
+            break;
         }
     }
 
     return targets;
 }
+
 
 Ragebot::TargetData Ragebot::selectBestTarget(const std::vector<TargetData>& targets,
     int priorityMode) noexcept {
@@ -1107,7 +1183,7 @@ namespace AutoStop {
             return;
 
         const Vector velocity = EnginePrediction::getVelocity();
-        const float speed = velocity.length2D();
+        const float speed = VectorSIMD::distance2DFast(Vector{ 0,0,0 }, velocity);
 
         if (speed < 1.f)
             return;
@@ -1118,6 +1194,7 @@ namespace AutoStop {
 
         // Вектор для остановки
         const Vector negatedDirection = Vector::fromAngle(direction) * -speed;
+
 
         if (targetSpeed <= 0.f) {
             // Полная остановка

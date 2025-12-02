@@ -1,729 +1,851 @@
-// AntiAim.cpp - ÓËÓ×ØÅÍÍÀß ÂÅÐÑÈß ÄËß TOP-1 HVH
-
 #include "../Interfaces.h"
+#include <random>
+#include <cmath>
 #include "AimbotFunctions.h"
 #include "AntiAim.h"
+
+#include "../imgui/imgui.h"
+#define IMGUI_DEFINE_MATH_OPERATORS
+#include "../imgui/imgui_internal.h"
 #include "../GameData.h"
 #include "../Memory.h"
 #include "../SDK/Engine.h"
+#include "../Netvars.h"
 #include "../SDK/Entity.h"
 #include "../SDK/EngineTrace.h"
 #include "../SDK/EntityList.h"
 #include "../SDK/NetworkChannel.h"
 #include "../SDK/UserCmd.h"
 #include "Tickbase.h"
-#include "../includes.hpp"
+#include "../Config.h"
+#include "../SDK/LocalPlayer.h"
 
-// Ãëîáàëüíûå ïåðåìåííûå
-static bool isShooting{ false };
-static bool didShoot{ false };
-static float lastShotTime{ 0.f };
-static bool invert = false;
+// ============================================
+// UTILITY FUNCTIONS
+// ============================================
 
-// ÓËÓ×ØÅÍÈÅ: áîëåå áåçîïàñíûé random
-static float safeRandomFloat(float min, float max) noexcept
-{
-    if (min > max)
-        std::swap(min, max);
-
-    const float random = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-    return min + random * (max - min);
+float AntiAim::normalizeYaw(float yaw) noexcept {
+    while (yaw > 180.f) yaw -= 360.f;
+    while (yaw < -180.f) yaw += 360.f;
+    return yaw;
 }
 
-// ÓËÓ×ØÅÍÍÀß ÔÓÍÊÖÈß: LBY update detection
-bool updateLby(bool update = false) noexcept
-{
+float AntiAim::randomFloat(float min, float max) noexcept {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(min, max);
+    return dis(gen);
+}
+
+// Âîçâðàùàåò int äëÿ ñîâìåñòèìîñòè ñ config->rageAntiAim[index]
+int AntiAim::getMovingFlag(UserCmd* cmd) noexcept {
+    if (!localPlayer)
+        return 0; // STANDING
+
+    const float speed = localPlayer->velocity().length2D();
+    const bool onGround = (localPlayer->flags() & FL_ONGROUND) != 0;
+    const bool ducking = (cmd->buttons & UserCmd::IN_DUCK) != 0 || (localPlayer->flags() & FL_DUCKING) != 0;
+
+    if (!onGround)
+        return 6; // IN_AIR
+
+    if (ducking) {
+        if (speed > 3.f)
+            return 5; // DUCKING_MOVING
+        return 4; // DUCKING
+    }
+
+    if (speed < 3.f)
+        return 0; // STANDING
+
+    if (speed > 110.f)
+        return 3; // RUNNING
+
+    if (speed > 50.f)
+        return 1; // MOVING
+
+    return 2; // SLOW_WALKING
+}
+
+void AntiAim::reset() noexcept {
+    state = AntiAimState{};
+    auto_direction_yaw = 0;
+    isShooting = false;
+    didShoot = false;
+    lastShotTime = 0.f;
+    invert = true;
+    r8Working = false;
+}
+
+// ============================================
+// LBY FUNCTIONS
+// ============================================
+
+bool AntiAim::updateLBY(bool update) noexcept {
     static float timer = 0.f;
     static bool lastValue = false;
 
     if (!update)
         return lastValue;
 
-    if (!localPlayer || !(localPlayer->flags() & FL_ONGROUND) || !localPlayer->getAnimstate())
-    {
+    if (!localPlayer || !(localPlayer->flags() & FL_ONGROUND) || !localPlayer->getAnimstate()) {
         lastValue = false;
+        state.lby.standingTime = 0.f;
         return false;
     }
 
-    const float velocity2D = localPlayer->velocity().length2D();
-    const float velocityZ = std::abs(localPlayer->velocity().z);
+    const float speed = localPlayer->velocity().length2D();
+    const float verticalSpeed = std::fabsf(localPlayer->velocity().z);
 
-    // ÓËÓ×ØÅÍÈÅ: áîëåå òî÷íûå óñëîâèÿ LBY update
-    if (velocity2D > 0.1f || velocityZ > 100.f)
-    {
+    if (speed > 0.1f || verticalSpeed > 100.f) {
         timer = memory->globalVars->serverTime() + 0.22f;
+        state.lby.standingTime = 0.f;
+        state.lby.justUpdated = false;
+    }
+    else {
+        state.lby.standingTime += memory->globalVars->intervalPerTick;
     }
 
-    if (timer < memory->globalVars->serverTime())
-    {
+    state.lby.nextUpdateTime = timer;
+    state.lby.willUpdate = timer < memory->globalVars->serverTime();
+
+    if (timer < memory->globalVars->serverTime()) {
         timer = memory->globalVars->serverTime() + 1.1f;
         lastValue = true;
+        state.lby.justUpdated = true;
         return true;
     }
 
     lastValue = false;
+    state.lby.justUpdated = false;
     return false;
 }
 
-// ÓËÓ×ØÅÍÍÀß ÔÓÍÊÖÈß: Distortion ñ áîëåå ïëàâíîé àíèìàöèåé
-void distortion(UserCmd* cmd, int movingFlag) noexcept
-{
-    auto speed = config->rageAntiAim[movingFlag].distortionSpeed;
-    auto amount = config->rageAntiAim[movingFlag].distortionAmount;
-
-    if (speed <= 0)
-        speed = safeRandomFloat(50.f, 100.f);
-    if (amount <= 0)
-        amount = safeRandomFloat(180.f, 360.f);
-
-    // ÓËÓ×ØÅÍÈÅ: áîëåå ñëîæíàÿ ñèíóñîèäà
-    const float time = memory->globalVars->currenttime * (speed / 10.f);
-    const float sine = std::sin(time);
-    const float cosine = std::cos(time * 0.5f);
-
-    const float distortionValue = ((sine * 0.7f + cosine * 0.3f + 1.f) / 2.f) * amount;
-
-    cmd->viewangles.y += distortionValue - (amount / 2.f);
-}
-
-// ÓËÓ×ØÅÍÍÀß ÔÓÍÊÖÈß: Auto direction (freestanding)
-bool autoDirection(const Vector& eyeAngle) noexcept
-{
-    if (!localPlayer)
+bool AntiAim::predictLBYUpdate() noexcept {
+    if (!localPlayer || !localPlayer->getAnimstate())
         return false;
 
+    const float timeUntilUpdate = state.lby.nextUpdateTime - memory->globalVars->serverTime();
+    return timeUntilUpdate > 0.f && timeUntilUpdate < memory->globalVars->intervalPerTick * 2.f;
+}
+
+// ============================================
+// AUTO DIRECTION
+// ============================================
+
+bool AntiAim::autoDirection(const Vector& eyeAngle) noexcept {
     constexpr float maxRange = 8192.0f;
 
     Vector eye = eyeAngle;
     eye.x = 0.f;
 
-    // Left 45 degrees
     Vector eyeAnglesLeft45 = eye;
-    eyeAnglesLeft45.y += 45.f;
-
-    // Right 45 degrees
     Vector eyeAnglesRight45 = eye;
+    eyeAnglesLeft45.y += 45.f;
     eyeAnglesRight45.y -= 45.f;
 
-    // Convert to forward vectors
-    Vector forwardLeft, rightLeft, upLeft;
-    Vector forwardRight, rightRight, upRight;
-    Helpers::AngleVectors(eyeAnglesLeft45, &forwardLeft, &rightLeft, &upLeft);
-    Helpers::AngleVectors(eyeAnglesRight45, &forwardRight, &rightRight, &upRight);
-
-    const Vector viewAnglesLeft45 = forwardLeft * maxRange;
-    const Vector viewAnglesRight45 = forwardRight * maxRange;
-
-    const Vector startPosition = localPlayer->getEyePosition();
+    Vector viewAnglesLeft45 = Vector::fromAngle(eyeAnglesLeft45) * maxRange;
+    Vector viewAnglesRight45 = Vector::fromAngle(eyeAnglesRight45) * maxRange;
 
     Trace traceLeft45, traceRight45;
-    interfaces->engineTrace->traceRay({ startPosition, startPosition + viewAnglesLeft45 }, 0x4600400B, { localPlayer.get() }, traceLeft45);
-    interfaces->engineTrace->traceRay({ startPosition, startPosition + viewAnglesRight45 }, 0x4600400B, { localPlayer.get() }, traceRight45);
+    Vector startPosition = localPlayer->getEyePosition();
 
-    const float distanceLeft45 = (startPosition - traceLeft45.endpos).length();
-    const float distanceRight45 = (startPosition - traceRight45.endpos).length();
+    interfaces->engineTrace->traceRay(
+        { startPosition, startPosition + viewAnglesLeft45 },
+        0x4600400B, { localPlayer.get() }, traceLeft45
+    );
+    interfaces->engineTrace->traceRay(
+        { startPosition, startPosition + viewAnglesRight45 },
+        0x4600400B, { localPlayer.get() }, traceRight45
+    );
 
-    // ÓËÓ×ØÅÍÈÅ: âîçâðàùàåì ñòîðîíó ñ áîëüøèì ïðîñòðàíñòâîì
+    float distanceLeft45 = startPosition.distTo(traceRight45.endpos);
+    float distanceRight45 = startPosition.distTo(traceLeft45.endpos);
+
     return distanceLeft45 < distanceRight45;
 }
 
-// ÓËÓ×ØÅÍÍÀß ÔÓÍÊÖÈß: JitterMove
-void AntiAim::JitterMove(UserCmd* cmd) noexcept
-{
-    if (!localPlayer || !(localPlayer->flags() & FL_ONGROUND))
-        return;
-
-    const auto activeWeapon = localPlayer->getActiveWeapon();
-    if (activeWeapon && activeWeapon->isGrenade())
-        return;
-
-    const float totalMove = std::abs(cmd->sidemove) + std::abs(cmd->forwardmove);
-    if (totalMove < 10.f)
-        return;
-
-    const float velocity2D = localPlayer->velocity().length2D();
-    if (velocity2D < 140.f)
-        return;
-
-    // ÓËÓ×ØÅÍÈÅ: áîëåå ïëàâíûé jitter factor
-    const float timeFactor = std::fmod(memory->globalVars->currenttime, 0.2f);
-    const float factor = 0.95f + timeFactor * 0.25f;
-
-    cmd->sidemove = std::clamp(cmd->sidemove, -250.f, 250.f) * factor;
-    cmd->forwardmove = std::clamp(cmd->forwardmove, -250.f, 250.f) * factor;
+int AntiAim::getAutoDirectionSide(const Vector& eyeAngle) noexcept {
+    return autoDirection(eyeAngle) ? 1 : -1;
 }
 
-// ÍÎÂÀß ÔÓÍÊÖÈß: Knife detection (anti-backstab)
-static bool detectKnifeThreat(float& yawToKnifer) noexcept
-{
+// ============================================
+// FREESTAND
+// ============================================
+
+void AntiAim::applyFreestand(UserCmd* cmd, int movingFlag) noexcept {
+    if (!config->freestandKey.isActive())
+        return;
+
+    const auto& cfg = config->rageAntiAim[movingFlag];
+    if (!cfg.freestand)
+        return;
+
+    constexpr std::array positions = { -30.0f, 0.0f, 30.0f };
+    std::array<bool, 3> active = { false, false, false };
+
+    const auto fwd = Vector::fromAngle2D(cmd->viewangles.y);
+    const auto side = fwd.crossProduct(Vector::up());
+    const Vector eyePos = localPlayer->getEyePosition();
+
+    for (std::size_t i = 0; i < positions.size(); i++) {
+        const auto start = eyePos + side * positions[i];
+        const auto end = start + fwd * 100.0f;
+
+        Trace trace{};
+        interfaces->engineTrace->traceRay({ start, end }, 0x1 | 0x2, nullptr, trace);
+
+        if (trace.fraction != 1.0f)
+            active[i] = true;
+    }
+
+    if (active[0] && active[1] && !active[2]) {
+        state.freestand.side = -1;
+        state.freestand.isActive = true;
+        auto_direction_yaw = -1;
+    }
+    else if (!active[0] && active[1] && active[2]) {
+        state.freestand.side = 1;
+        state.freestand.isActive = true;
+        auto_direction_yaw = 1;
+    }
+    else {
+        state.freestand.side = 0;
+        state.freestand.isActive = false;
+        auto_direction_yaw = 0;
+    }
+}
+
+// ============================================
+// KNIFE THREAT DETECTION
+// ============================================
+
+bool AntiAim::detectKnifeThreat(UserCmd* cmd) noexcept {
     if (!localPlayer)
         return false;
 
-    const Vector localEye = localPlayer->getEyePosition();
-    const Vector localOrigin = localPlayer->getAbsOrigin();
+    const Vector localPos = localPlayer->getAbsOrigin();
+    const Vector eyePos = localPlayer->getEyePosition();
 
-    float closestDistance = FLT_MAX;
-    bool threatDetected = false;
-
-    for (int i = 1; i <= interfaces->engine->getMaxClients(); ++i)
-    {
+    for (int i = 1; i <= interfaces->engine->getMaxClients(); ++i) {
         const auto entity = interfaces->entityList->getEntity(i);
-        if (!entity || entity == localPlayer.get() || entity->isDormant() ||
-            !entity->isAlive() || !entity->isOtherEnemy(localPlayer.get()))
-        {
+        if (!entity || entity == localPlayer.get() || entity->isDormant() || !entity->isAlive())
             continue;
-        }
+
+        if (!entity->isOtherEnemy(localPlayer.get()))
+            continue;
+
+        float distance = entity->getAbsOrigin().distTo(localPos);
+        if (distance > 350.f)
+            continue;
 
         const auto weapon = entity->getActiveWeapon();
         if (!weapon || !weapon->isKnife())
             continue;
 
-        const float distance = (entity->getAbsOrigin() - localOrigin).length();
+        state.willGetStabbed = true;
+        state.knifeAttacker = entity;
+        return true;
+    }
 
-        // ÊÐÈÒÈ×ÅÑÊÀß ÄÈÑÒÀÍÖÈß äëÿ backstab
-        if (distance > 469.f)
+    state.willGetStabbed = false;
+    state.knifeAttacker = nullptr;
+    return false;
+}
+
+void AntiAim::handleKnifeThreat(UserCmd* cmd, float& yaw, float& pitch) noexcept {
+    if (!state.willGetStabbed || !state.knifeAttacker)
+        return;
+
+    const Vector localPos = localPlayer->getEyePosition();
+    const Vector enemyPos = state.knifeAttacker->getAbsOrigin();
+
+    Vector angle = AimbotFunction::calculateRelativeAngle(localPos, enemyPos, cmd->viewangles);
+    yaw = angle.y + 180.f;
+    pitch = 0.f;
+}
+
+// ============================================
+// ANIM BREAKERS
+// ============================================
+
+void AntiAim::JitterMove(UserCmd* cmd) noexcept {
+    if (!localPlayer || !(localPlayer->flags() & FL_ONGROUND))
+        return;
+
+    if (localPlayer->getActiveWeapon() && localPlayer->getActiveWeapon()->isGrenade())
+        return;
+
+    if (std::abs(cmd->sidemove) + std::abs(cmd->forwardmove) < 10.f)
+        return;
+
+    if (localPlayer->velocity().length2D() < 140.f)
+        return;
+
+    float factor = 0.95f + std::fmod(memory->globalVars->currenttime, 0.2f) * 0.25f;
+
+    cmd->sidemove = std::clamp(cmd->sidemove, -250.f, 250.f) * factor;
+    cmd->forwardmove = std::clamp(cmd->forwardmove, -250.f, 250.f) * factor;
+}
+
+void AntiAim::microMovement(UserCmd* cmd) noexcept {
+    if (!localPlayer || !(localPlayer->flags() & FL_ONGROUND))
+        return;
+
+    if (std::fabsf(cmd->sidemove) >= 5.0f)
+        return;
+
+    float moveAmount = (cmd->buttons & UserCmd::IN_DUCK) ? 3.25f : 1.1f;
+    cmd->sidemove = (cmd->tickCount & 1) ? moveAmount : -moveAmount;
+}
+
+void AntiAim::applyAnimBreakers(UserCmd* cmd) noexcept {
+    if (!config->condAA.animBreakers)
+        return;
+
+    if ((config->condAA.animBreakers & (1 << 4)) != 0)
+        JitterMove(cmd);
+
+    if ((config->condAA.animBreakers & (1 << 0)) != 0)
+        microMovement(cmd);
+}
+
+// ============================================
+// DISTORTION
+// ============================================
+
+void AntiAim::applyDistortion(UserCmd* cmd, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (!cfg.distortion)
+        return;
+
+    float speed = cfg.distortionSpeed;
+    float amount = cfg.distortionAmount;
+
+    if (speed <= 0.f)
+        speed = randomFloat(10.f, 100.f);
+    if (amount <= 0.f)
+        amount = randomFloat(10.f, 60.f);
+
+    const float sine = ((std::sin(memory->globalVars->currenttime * (speed / 10.f)) + 1.f) / 2.f) * amount;
+    cmd->viewangles.y += sine - (amount / 2.f);
+}
+
+// ============================================
+// PITCH
+// ============================================
+
+float AntiAim::calculatePitch(UserCmd* cmd, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (state.willGetStabbed)
+        return 0.f;
+
+    switch (cfg.pitch) {
+    case 0: // None
+        return cmd->viewangles.x;
+    case 1: // Down
+        return 89.f;
+    case 2: // Zero
+        return 0.f;
+    case 3: // Up
+        return -89.f;
+    case 4: // Fake pitch
+        return (memory->globalVars->tickCount % 20 == 0) ? -89.f : 89.f;
+    case 5: // Random
+        return randomFloat(-89.f, 89.f);
+    default:
+        return 89.f;
+    }
+}
+
+// ============================================
+// YAW BASE
+// ============================================
+
+float AntiAim::calculateBaseYaw(UserCmd* cmd, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+    float yaw = 0.f;
+
+    switch (cfg.yawBase) {
+    case Yaw::off:
+        return cmd->viewangles.y;
+    case Yaw::forward:
+        yaw = 0.f;
+        break;
+    case Yaw::backward:
+        yaw = 180.f;
+        break;
+    case Yaw::right:
+        yaw = -90.f;
+        break;
+    case Yaw::left:
+        yaw = 90.f;
+        break;
+    case Yaw::spin:
+        yaw = std::fmod(memory->globalVars->currenttime * cfg.spinBase * 10.f, 360.f) - 180.f;
+        break;
+    default:
+        yaw = 180.f;
+        break;
+    }
+
+    return yaw;
+}
+
+float AntiAim::applyAtTargets(float yaw, UserCmd* cmd) noexcept {
+    if (!localPlayer)
+        return yaw;
+
+    const Vector eyePos = localPlayer->getEyePosition();
+    const Vector aimPunch = localPlayer->getAimPunch();
+
+    float bestFov = 255.f;
+    float targetYaw = 0.f;
+    bool foundTarget = false;
+
+    for (int i = 1; i <= interfaces->engine->getMaxClients(); ++i) {
+        const auto entity = interfaces->entityList->getEntity(i);
+        if (!entity || entity == localPlayer.get() || entity->isDormant() || !entity->isAlive())
+            continue;
+
+        if (!entity->isOtherEnemy(localPlayer.get()))
             continue;
 
         const auto angle = AimbotFunction::calculateRelativeAngle(
-            localEye,
-            entity->getAbsOrigin(),
-            Vector{}
-        );
-
+            eyePos, entity->getAbsOrigin(), cmd->viewangles + aimPunch);
         const float fov = angle.length2D();
 
-        if (distance < closestDistance)
-        {
-            closestDistance = distance;
-            yawToKnifer = angle.y;
-            threatDetected = true;
+        if (fov < bestFov) {
+            targetYaw = angle.y;
+            bestFov = fov;
+            foundTarget = true;
         }
     }
 
-    return threatDetected;
+    if (foundTarget)
+        return yaw + targetYaw;
+
+    return yaw;
 }
 
-// ÎÑÍÎÂÍÀß ÔÓÍÊÖÈß ANTIAIM
-void AntiAim::rage(UserCmd* cmd, const Vector& previousViewAngles, const Vector& currentViewAngles, bool& sendPacket) noexcept
-{
+float AntiAim::applyManualYaw(float yaw) noexcept {
+    const bool forward = config->manualForward.isActive();
+    const bool back = config->manualBackward.isActive();
+    const bool right = config->manualRight.isActive();
+    const bool left = config->manualLeft.isActive();
+
+    if (!forward && !back && !right && !left) {
+        state.isManualOverride = false;
+        return yaw;
+    }
+
+    state.isManualOverride = true;
+    float manualYaw = 0.f;
+
+    if (back) {
+        manualYaw = -180.f;
+        if (left) manualYaw -= 45.f;
+        else if (right) manualYaw += 45.f;
+    }
+    else if (left) {
+        manualYaw = 90.f;
+        if (back) manualYaw += 45.f;
+        else if (forward) manualYaw -= 45.f;
+    }
+    else if (right) {
+        manualYaw = -90.f;
+        if (back) manualYaw -= 45.f;
+        else if (forward) manualYaw += 45.f;
+    }
+    else if (forward) {
+        manualYaw = 0.f;
+    }
+
+    return manualYaw;
+}
+
+// ============================================
+// JITTER MODIFIERS
+// ============================================
+
+float AntiAim::applyJitterCentered(float yaw, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    float jitterAmount = randomFloat(cfg.jitterMin, cfg.jitterRange);
+
+    if (cfg.desync && cfg.peekMode == 3) {
+        return yaw + (invert ? jitterAmount : -jitterAmount);
+    }
+
+    return yaw + (state.jitterFlip ? jitterAmount : -jitterAmount);
+}
+
+float AntiAim::applyJitterOffset(float yaw, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (!state.jitterFlip)
+        return yaw;
+
+    float jitterAmount = randomFloat(cfg.jitterMin, cfg.jitterRange);
+    return yaw + (config->invert.isActive() ? jitterAmount : -jitterAmount);
+}
+
+float AntiAim::applyJitterRandom(float yaw, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+    return yaw + randomFloat(-cfg.randomRange, cfg.randomRange);
+}
+
+float AntiAim::applyJitter3Way(float yaw, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    static int stage = 0;
+    float offset = 0.f;
+
+    switch (stage) {
+    case 0: offset = -cfg.jitterRange; break;
+    case 1: offset = 0.f; break;
+    case 2: offset = cfg.jitterRange; break;
+    case 3: offset = 0.f; break;
+    }
+
+    stage = (stage + 1) % 4;
+    return yaw + offset;
+}
+
+float AntiAim::applyJitter5Way(float yaw, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    static int stage = 0;
+    float offset = 0.f;
+
+    switch (stage) {
+    case 0: offset = -cfg.jitterRange; break;
+    case 1: offset = -cfg.jitterRange / 2.f; break;
+    case 2: offset = 0.f; break;
+    case 3: offset = cfg.jitterRange / 2.f; break;
+    case 4: offset = cfg.jitterRange; break;
+    case 5: offset = cfg.jitterRange / 2.f; break;
+    case 6: offset = 0.f; break;
+    case 7: offset = -cfg.jitterRange / 2.f; break;
+    }
+
+    stage = (stage + 1) % 8;
+    return yaw + offset;
+}
+
+float AntiAim::applySpin(float yaw, UserCmd* cmd, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+    return -180.0f + (cmd->tickCount % 9) * cfg.spinBase;
+}
+
+float AntiAim::applyYawModifier(float yaw, UserCmd* cmd, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (state.isManualOverride || state.freestand.isActive || state.willGetStabbed)
+        return yaw;
+
+    switch (cfg.yawModifier) {
+    case 0: // None
+        break;
+    case 1: // Jitter Centered
+        yaw = applyJitterCentered(yaw, movingFlag);
+        break;
+    case 2: // Jitter Offset
+        yaw = applyJitterOffset(yaw, movingFlag);
+        break;
+    case 3: // Random
+        yaw = applyJitterRandom(yaw, movingFlag);
+        break;
+    case 4: // 3-Way
+        yaw = applyJitter3Way(yaw, movingFlag);
+        break;
+    case 5: // 5-Way
+        yaw = applyJitter5Way(yaw, movingFlag);
+        break;
+    case 6: // Spin
+        yaw = applySpin(yaw, cmd, movingFlag);
+        break;
+    default:
+        break;
+    }
+
+    return yaw;
+}
+
+// ============================================
+// FAKE FLICK
+// ============================================
+
+void AntiAim::applyFakeFlick(float& yaw, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (!cfg.fakeFlick || !config->fakeFlickOnKey.isActive())
+        return;
+
+    if (state.willGetStabbed)
+        return;
+
+    int rate = cfg.fakeFlickRate;
+    if (rate <= 0) rate = 10;
+
+    int tick = memory->globalVars->tickCount % rate;
+
+    if (tick == 0) {
+        yaw += config->flipFlick.isActive() ? -90.f : 90.f;
+    }
+}
+
+// ============================================
+// ROLL
+// ============================================
+
+float AntiAim::calculateRoll(int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (!cfg.roll.enabled)
+        return 0.f;
+
+    if (!localPlayer || localPlayer->velocity().length2D() >= 100.f)
+        return 0.f;
+
+    return invert ? cfg.roll.add : -cfg.roll.add;
+}
+
+// ============================================
+// DESYNC
+// ============================================
+
+float AntiAim::getDesyncDelta(bool inverted, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (inverted) {
+        return randomFloat(cfg.leftMin, cfg.leftLimit) * 2.f;
+    }
+    return randomFloat(cfg.rightMin, cfg.rightLimit) * -2.f;
+}
+
+void AntiAim::handleLBYBreak(UserCmd* cmd, bool& sendPacket, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    float leftDelta = getDesyncDelta(false, movingFlag);
+    float rightDelta = getDesyncDelta(true, movingFlag);
+
+    switch (cfg.lbyMode) {
+    case 0: // Normal (sidemove)
+        microMovement(cmd);
+        break;
+
+    case 1: // Opposite (LBY break)
+        if (updateLBY()) {
+            cmd->viewangles.y += !invert ? leftDelta : rightDelta;
+            sendPacket = false;
+            return;
+        }
+        break;
+
+    case 2: // Sway
+    {
+        static bool flip = false;
+        if (updateLBY()) {
+            cmd->viewangles.y += !flip ? leftDelta : rightDelta;
+            sendPacket = false;
+            flip = !flip;
+            return;
+        }
+        if (!sendPacket)
+            cmd->viewangles.y += flip ? leftDelta : rightDelta;
+        break;
+    }
+
+    case 3: // Fake
+        if (updateLBY()) {
+            cmd->viewangles.y += !invert ? leftDelta : rightDelta;
+            sendPacket = false;
+            return;
+        }
+        if (!sendPacket)
+            cmd->viewangles.y += invert ? leftDelta : rightDelta;
+        break;
+    }
+}
+
+void AntiAim::applyDesync(UserCmd* cmd, bool& sendPacket, int movingFlag) noexcept {
+    const auto& cfg = config->rageAntiAim[movingFlag];
+
+    if (!cfg.desync || Tickbase::isShifting())
+        return;
+
+    // Roll
+    cmd->viewangles.z = calculateRoll(movingFlag);
+
+    // Invert handling
+    bool isInvertToggled = config->invert.isActive();
+
+    if (cfg.peekMode != 3) {
+        invert = isInvertToggled;
+    }
+
+    // Peek modes
+    switch (cfg.peekMode) {
+    case 0: // Off
+        break;
+    case 1: // Peek Real
+        invert = isInvertToggled ? autoDirection(cmd->viewangles) : !autoDirection(cmd->viewangles);
+        break;
+    case 2: // Peek Fake
+        invert = isInvertToggled ? !autoDirection(cmd->viewangles) : autoDirection(cmd->viewangles);
+        break;
+    case 3: // Jitter
+        if (sendPacket) {
+            if (cfg.yawModifier == 7) {
+                if (memory->globalVars->tickCount % cfg.tickDelays == 0)
+                    invert = !invert;
+            }
+            else {
+                invert = !invert;
+            }
+        }
+        break;
+    case 4: // Switch on move
+        if (sendPacket && localPlayer->velocity().length2D() > 5.0f) {
+            invert = !invert;
+        }
+        break;
+    }
+
+    // Update state
+    state.desync.isInverted = invert;
+    state.desync.side = invert ? 1 : -1;
+
+    // LBY handling
+    handleLBYBreak(cmd, sendPacket, movingFlag);
+
+    if (sendPacket)
+        return;
+
+    // Apply desync delta on choked packet
+    float desyncDelta = getDesyncDelta(invert, movingFlag);
+    cmd->viewangles.y += desyncDelta;
+
+    state.desync.desyncDelta = desyncDelta;
+}
+
+// ============================================
+// MAIN RAGE FUNCTION
+// ============================================
+
+void AntiAim::rage(UserCmd* cmd, const Vector& previousViewAngles,
+    const Vector& currentViewAngles, bool& sendPacket) noexcept {
+
     if (!config->condAA.global)
         return;
 
-    static float knifeYaw = 0.f;
-    const bool knifeThre = detectKnifeThreat(knifeYaw);
+    int movingFlag = getMovingFlag(cmd);
+    const auto& cfg = config->rageAntiAim[movingFlag];
 
-    // Animation breakers
-    if ((config->condAA.animBreakers & (1 << 4)) == (1 << 4))
-        JitterMove(cmd);
+    // Anim breakers
+    applyAnimBreakers(cmd);
 
-    const auto moving_flag = get_moving_flag(cmd);
+    // Detect knife threat
+    detectKnifeThreat(cmd);
 
-    // ===== PITCH =====
-    if (cmd->viewangles.x == currentViewAngles.x || Tickbase::isShifting())
-    {
-        // Anti-backstab: look at knifer
-        if (knifeThre)
-        {
-            cmd->viewangles.x = 0.f;
-        }
-        else
-        {
-            switch (config->rageAntiAim[static_cast<int>(moving_flag)].pitch)
-            {
-            case 0: // None
-                break;
-            case 1: // Down
-                cmd->viewangles.x = 89.f;
-                break;
-            case 2: // Zero
-                cmd->viewangles.x = 0.f;
-                break;
-            case 3: // Up
-                cmd->viewangles.x = -89.f;
-                break;
-            case 4: // Fake pitch (jitter)
-            {
-                const bool jitterDown = (memory->globalVars->tickCount % 20) == 0;
-                cmd->viewangles.x = jitterDown ? -89.f : 89.f;
-                break;
-            }
-            case 5: // Random
-            {
-                cmd->viewangles.x = std::round(safeRandomFloat(-89.f, 89.f));
-                break;
-            }
-            default:
-                break;
-            }
-        }
+    // Update jitter flip on send packet
+    if (sendPacket && !getDidShoot()) {
+        state.jitterFlip = !state.jitterFlip;
     }
 
-    // ===== YAW =====
-    if (cmd->viewangles.y == currentViewAngles.y || Tickbase::isShifting())
-    {
-        if (config->rageAntiAim[static_cast<int>(moving_flag)].yawBase != Yaw::off)
-        {
-            // Manual AA
-            const bool forward = config->manualForward.isActive();
-            const bool back = config->manualBackward.isActive();
-            const bool right = config->manualRight.isActive();
-            const bool left = config->manualLeft.isActive();
-            const bool isManualSet = forward || back || right || left;
+    // === PITCH ===
+    if (cmd->viewangles.x == currentViewAngles.x || Tickbase::isShifting()) {
+        cmd->viewangles.x = calculatePitch(cmd, movingFlag);
+    }
 
-            float yaw = 0.f;
-            static bool flipJitter = false;
-            bool isFreestanding = false;
+    // === YAW ===
+    if (cmd->viewangles.y == currentViewAngles.y || Tickbase::isShifting()) {
+        if (cfg.yawBase != Yaw::off) {
+            float yaw = calculateBaseYaw(cmd, movingFlag);
 
-            // At targets (lock onto closest enemy)
-            if (config->rageAntiAim[static_cast<int>(moving_flag)].atTargets &&
-                localPlayer->moveType() != MoveType::LADDER && !knifeThre)
-            {
-                const Vector localEye = localPlayer->getEyePosition();
-                const Vector aimPunch = localPlayer->getAimPunch();
+            // At targets
+            if (cfg.atTargets && localPlayer->moveType() != MoveType::LADDER && !state.willGetStabbed) {
+                yaw = applyAtTargets(yaw, cmd);
+            }
 
-                float bestFov = FLT_MAX;
-                float yawAngle = 0.f;
+            // Knife threat handling
+            if (state.willGetStabbed) {
+                handleKnifeThreat(cmd, yaw, cmd->viewangles.x);
+            }
+            else {
+                // Freestand
+                applyFreestand(cmd, movingFlag);
 
-                for (int i = 1; i <= interfaces->engine->getMaxClients(); ++i)
-                {
-                    const auto entity = interfaces->entityList->getEntity(i);
-                    if (!entity || entity == localPlayer.get() || entity->isDormant() ||
-                        !entity->isAlive() || !entity->isOtherEnemy(localPlayer.get()))
-                    {
-                        continue;
+                if (state.freestand.isActive) {
+                    yaw = state.freestand.side == -1 ? 90.f : -90.f;
+                }
+                else {
+                    // Manual override
+                    yaw = applyManualYaw(yaw);
+
+                    // Fake flick
+                    if (!state.isManualOverride) {
+                        applyFakeFlick(yaw, movingFlag);
                     }
 
-                    const auto angle = AimbotFunction::calculateRelativeAngle(
-                        localEye,
-                        entity->getAbsOrigin(),
-                        cmd->viewangles + aimPunch
-                    );
+                    // Yaw modifier (jitter, spin, etc)
+                    yaw = applyYawModifier(yaw, cmd, movingFlag);
 
-                    const float fov = angle.length2D();
-                    if (fov < bestFov)
-                    {
-                        yawAngle = angle.y;
-                        bestFov = fov;
+                    // Yaw add
+                    if (!state.isManualOverride && !state.freestand.isActive) {
+                        yaw += static_cast<float>(cfg.yawAdd);
                     }
-                }
 
-                yaw = yawAngle;
-            }
-
-            // Anti-backstab: face the knifer
-            if (knifeThre)
-            {
-                yaw = knifeYaw;
-            }
-            else
-            {
-                // Yaw base
-                switch (config->rageAntiAim[static_cast<int>(moving_flag)].yawBase)
-                {
-                case Yaw::forward:
-                    yaw += 0.f;
-                    break;
-                case Yaw::backward:
-                    yaw += 180.f;
-                    break;
-                case Yaw::right:
-                    yaw += -90.f;
-                    break;
-                case Yaw::left:
-                    yaw += 90.f;
-                    break;
-                default:
-                    break;
-                }
-            }
-
-            // Manual overrides (if not knife threat)
-            if (!knifeThre)
-            {
-                if (back)
-                {
-                    yaw = 180.f;
-                    if (left)
-                        yaw += 45.f;
-                    else if (right)
-                        yaw -= 45.f;
-                }
-                else if (left)
-                {
-                    yaw = 90.f;
-                    if (back)
-                        yaw += 45.f;
-                    else if (forward)
-                        yaw -= 45.f;
-                }
-                else if (right)
-                {
-                    yaw = -90.f;
-                    if (back)
-                        yaw -= 45.f;
-                    else if (forward)
-                        yaw += 45.f;
-                }
-                else if (forward)
-                {
-                    yaw = 0.f;
-                }
-            }
-
-            // Fake flick
-            if (config->rageAntiAim[static_cast<int>(moving_flag)].fakeFlick &&
-                config->fakeFlickOnKey.isActive() && !knifeThre)
-            {
-                const int rate = config->rageAntiAim[static_cast<int>(moving_flag)].fakeFlickRate;
-                const int tick = memory->globalVars->tickCount % rate;
-
-                if (tick == 0)
-                {
-                    yaw += config->flipFlick.isActive() ? -90.f : 90.f;
-                }
-            }
-
-            // Freestanding
-            if (config->rageAntiAim[static_cast<int>(moving_flag)].freestand &&
-                config->freestandKey.isActive() && !knifeThre)
-            {
-                constexpr std::array positions = { -30.0f, 0.0f, 30.0f };
-                std::array<bool, 3> active = { false, false, false };
-
-                Vector forward, right, up;
-                Vector rightVec, upVec, dummy;
-                Helpers::AngleVectors(Vector{ 0.f, cmd->viewangles.y, 0.f }, & forward, & right, & up);
-                Helpers::AngleVectors(Vector{ 0.f, cmd->viewangles.y + 90.f, 0.f }, & rightVec, & dummy, & dummy);
-
-                const Vector side = right;
-
-                for (size_t i = 0; i < positions.size(); i++)
-                {
-                    const Vector start = localPlayer->getEyePosition() + side * positions[i];
-                    const Vector end = start + forward * 100.0f;
-
-                    Trace trace;
-                    interfaces->engineTrace->traceRay({ start, end }, 0x4600400B, nullptr, trace);
-
-                    if (trace.fraction != 1.0f)
-                        active[i] = true;
-                }
-
-                // Left side blocked
-                if (active[0] && active[1] && !active[2])
-                {
-                    yaw = 90.f;
-                    AntiAim::auto_direction_yaw = -1;
-                    isFreestanding = true;
-                }
-                // Right side blocked
-                else if (!active[0] && active[1] && active[2])
-                {
-                    yaw = -90.f;
-                    AntiAim::auto_direction_yaw = 1;
-                    isFreestanding = true;
-                }
-                else
-                {
-                    AntiAim::auto_direction_yaw = 0;
-                    isFreestanding = false;
-                }
-            }
-
-            // Flip jitter
-            if (sendPacket && !AntiAim::getDidShoot())
-                flipJitter = !flipJitter;
-
-            // Yaw modifier
-            if (!isManualSet && !isFreestanding && !knifeThre)
-            {
-                const float jitterMin = config->rageAntiAim[static_cast<int>(moving_flag)].jitterMin;
-                const float jitterRange = config->rageAntiAim[static_cast<int>(moving_flag)].jitterRange;
-                const float randomRange = config->rageAntiAim[static_cast<int>(moving_flag)].randomRange;
-                const float spinBase = config->rageAntiAim[static_cast<int>(moving_flag)].spinBase;
-
-                switch (config->rageAntiAim[static_cast<int>(moving_flag)].yawModifier)
-                {
-                case 0: // None
-                    break;
-
-                case 1: // Jitter centered
-                {
-                    const float jitterValue = safeRandomFloat(jitterMin, jitterRange);
-                    yaw += flipJitter ? jitterValue : -jitterValue;
-                    break;
-                }
-
-                case 2: // Jitter offset
-                {
-                    if (flipJitter)
-                    {
-                        const float jitterValue = safeRandomFloat(jitterMin, jitterRange);
-                        yaw += config->invert.isActive() ? jitterValue : -jitterValue;
+                    // Distortion
+                    if (!state.isManualOverride && !state.freestand.isActive && cfg.distortion) {
+                        applyDistortion(cmd, movingFlag);
                     }
-                    break;
-                }
-
-                case 3: // Random
-                {
-                    yaw += std::round(safeRandomFloat(-randomRange, randomRange));
-                    break;
-                }
-
-                case 4: // 3-way jitter
-                {
-                    static int stage = 0;
-                    switch (stage)
-                    {
-                    case 0:
-                        yaw -= jitterRange;
-                        stage = 1;
-                        break;
-                    case 1:
-                        yaw += 0.f;
-                        stage = 2;
-                        break;
-                    case 2:
-                        yaw += jitterRange;
-                        stage = 0;
-                        break;
-                    }
-                    break;
-                }
-
-                case 5: // 5-way jitter
-                {
-                    static int stage = 0;
-                    const float halfRange = jitterRange / 2.f;
-
-                    switch (stage)
-                    {
-                    case 0: yaw -= jitterRange; stage = 1; break;
-                    case 1: yaw -= halfRange; stage = 2; break;
-                    case 2: yaw += 0.f; stage = 3; break;
-                    case 3: yaw += halfRange; stage = 4; break;
-                    case 4: yaw += jitterRange; stage = 0; break;
-                    }
-                    break;
-                }
-
-                case 6: // Spin
-                {
-                    yaw = -180.0f + (cmd->tickCount % 360) * (spinBase / 40.f);
-                    break;
-                }
-
-                default:
-                    break;
-                }
-            }
-
-            // Yaw add
-            if (!isManualSet && !isFreestanding && !knifeThre)
-            {
-                yaw += static_cast<float>(config->rageAntiAim[static_cast<int>(moving_flag)].yawAdd);
-            }
-
-            // Distortion
-            if (!isManualSet && !isFreestanding && !knifeThre)
-            {
-                if (config->rageAntiAim[static_cast<int>(moving_flag)].distortion)
-                {
-                    distortion(cmd, static_cast<int>(moving_flag));
                 }
             }
 
             cmd->viewangles.y += yaw;
-        }
-    }
-
-    // ===== DESYNC (FAKE YAW) =====
-    if (config->rageAntiAim[static_cast<int>(moving_flag)].desync && !Tickbase::isShifting())
-    {
-        // Roll
-        if (config->rageAntiAim[static_cast<int>(moving_flag)].roll.enabled &&
-            localPlayer->velocity().length2D() < 100.f)
-        {
-            const float rollAdd = config->rageAntiAim[static_cast<int>(moving_flag)].roll.add;
-            cmd->viewangles.z = invert ? rollAdd : -rollAdd;
-        }
-        else
-        {
-            cmd->viewangles.z = 0.f;
+            state.currentYaw = normalizeYaw(cmd->viewangles.y);
         }
 
-        // Invert management
-        const bool isInvertToggled = config->invert.isActive();
-
-        if (config->rageAntiAim[static_cast<int>(moving_flag)].peekMode != 3)
-        {
-            invert = isInvertToggled;
-        }
-
-        const float leftMin = config->rageAntiAim[static_cast<int>(moving_flag)].leftMin;
-        const float leftLimit = config->rageAntiAim[static_cast<int>(moving_flag)].leftLimit;
-        const float rightMin = config->rageAntiAim[static_cast<int>(moving_flag)].rightMin;
-        const float rightLimit = config->rageAntiAim[static_cast<int>(moving_flag)].rightLimit;
-
-        const float leftDesyncAngle = safeRandomFloat(leftMin, leftLimit) * 2.f;
-        const float rightDesyncAngle = safeRandomFloat(rightMin, rightLimit) * -2.f;
-
-        // Peek mode
-        switch (config->rageAntiAim[static_cast<int>(moving_flag)].peekMode)
-        {
-        case 0: // None
-            break;
-
-        case 1: // Peek real
-            if (!isInvertToggled)
-                invert = !autoDirection(cmd->viewangles);
-            else
-                invert = autoDirection(cmd->viewangles);
-            break;
-
-        case 2: // Peek fake
-            if (isInvertToggled)
-                invert = !autoDirection(cmd->viewangles);
-            else
-                invert = autoDirection(cmd->viewangles);
-            break;
-
-        case 3: // Jitter
-            if (sendPacket)
-            {
-                const int yawMod = config->rageAntiAim[static_cast<int>(moving_flag)].yawModifier;
-
-                if (yawMod != 7)
-                {
-                    invert = !invert;
-                }
-                else
-                {
-                    const int tickDelay = config->rageAntiAim[static_cast<int>(moving_flag)].tickDelays;
-                    if ((memory->globalVars->tickCount % tickDelay) == 0)
-                        invert = !invert;
-                }
-            }
-            break;
-
-        case 4: // Switch (on move)
-            if (sendPacket && localPlayer->velocity().length2D() > 5.0f)
-            {
-                invert = !invert;
-            }
-            break;
-
-        default:
-            break;
-        }
-
-        // LBY mode
-        switch (config->rageAntiAim[static_cast<int>(moving_flag)].lbyMode)
-        {
-        case 0: // Normal (sidemove)
-        {
-            if (std::abs(cmd->sidemove) < 5.0f)
-            {
-                const bool duckJitter = cmd->buttons & UserCmd::IN_DUCK;
-                cmd->sidemove = (cmd->tickCount & 1) ?
-                    (duckJitter ? 3.25f : 1.1f) :
-                    (duckJitter ? -3.25f : -1.1f);
-            }
-            break;
-        }
-
-        case 1: // Opposite (LBY break)
-        {
-            if (updateLby())
-            {
-                cmd->viewangles.y += invert ? rightDesyncAngle : leftDesyncAngle;
-                sendPacket = false;
-                return;
-            }
-            break;
-        }
-
-        case 2: // Sway (flip every LBY update)
-        {
-            static bool flip = false;
-
-            if (updateLby())
-            {
-                cmd->viewangles.y += flip ? rightDesyncAngle : leftDesyncAngle;
-                sendPacket = false;
-                flip = !flip;
-                return;
-            }
-
-            if (!sendPacket)
-            {
-                cmd->viewangles.y += flip ? leftDesyncAngle : rightDesyncAngle;
-            }
-            break;
-        }
-
-        case 3: // Fake
-        {
-            if (updateLby())
-            {
-                cmd->viewangles.y += invert ? rightDesyncAngle : leftDesyncAngle;
-                sendPacket = false;
-                return;
-            }
-
-            if (!sendPacket)
-            {
-                cmd->viewangles.y += invert ? leftDesyncAngle : rightDesyncAngle;
-            }
-            break;
-        }
-
-        default:
-            break;
-        }
-
-        // ÊÐÈÒÈ×ÅÑÊÈ ÂÀÆÍÎ: fake angles òîëüêî íà choked packets
-        if (!sendPacket)
-        {
-            cmd->viewangles.y += invert ? leftDesyncAngle : rightDesyncAngle;
-        }
+        // === DESYNC ===
+        applyDesync(cmd, sendPacket, movingFlag);
     }
 }
 
-void AntiAim::updateInput() noexcept
-{
-    config->freestandKey.handleToggle();
-    config->invert.handleToggle();
-    config->fakeFlickOnKey.handleToggle();
-    config->flipFlick.handleToggle();
-    config->manualForward.handleToggle();
-    config->manualBackward.handleToggle();
-    config->manualRight.handleToggle();
-    config->manualLeft.handleToggle();
-}
+// ============================================
+// MAIN RUN FUNCTION
+// ============================================
 
-void AntiAim::run(UserCmd* cmd, const Vector& previousViewAngles, const Vector& currentViewAngles, bool& sendPacket) noexcept
-{
-    const auto moving_flag = get_moving_flag(cmd);
+void AntiAim::run(UserCmd* cmd, const Vector& previousViewAngles,
+    const Vector& currentViewAngles, bool& sendPacket) noexcept {
 
+    int movingFlag = getMovingFlag(cmd);
+
+    // Skip conditions
     if (cmd->buttons & UserCmd::IN_USE)
         return;
 
     if (localPlayer->moveType() == MoveType::LADDER || localPlayer->moveType() == MoveType::NOCLIP)
         return;
 
-    if (config->condAA.global || config->rageAntiAim[static_cast<int>(moving_flag)].desync)
-    {
-        AntiAim::rage(cmd, previousViewAngles, currentViewAngles, sendPacket);
+    // Run anti-aim
+    if (config->condAA.global || config->rageAntiAim[movingFlag].desync) {
+        rage(cmd, previousViewAngles, currentViewAngles, sendPacket);
     }
 }
 
-bool AntiAim::canRun(UserCmd* cmd) noexcept
-{
+// ============================================
+// CAN RUN CHECK
+// ============================================
+
+bool AntiAim::canRun(UserCmd* cmd) noexcept {
     if (!localPlayer || !localPlayer->isAlive())
         return false;
 
-    updateLby(true);
+    updateLBY(true);
 
     if ((*memory->gameRules)->freezePeriod())
         return false;
@@ -741,10 +863,7 @@ bool AntiAim::canRun(UserCmd* cmd) noexcept
     if (activeWeapon->isGrenade())
         return true;
 
-    if (localPlayer->shotsFired() > 0 && !activeWeapon->isFullAuto())
-        return true;
-
-    if (localPlayer->waitForNoAttack())
+    if (localPlayer->shotsFired() > 0 && !activeWeapon->isFullAuto() || localPlayer->waitForNoAttack())
         return true;
 
     if (localPlayer->nextAttack() > memory->globalVars->serverTime())
@@ -762,8 +881,7 @@ bool AntiAim::canRun(UserCmd* cmd) noexcept
     if (activeWeapon->nextPrimaryAttack() <= memory->globalVars->serverTime() && (cmd->buttons & UserCmd::IN_ATTACK))
         return false;
 
-    if (activeWeapon->isKnife())
-    {
+    if (activeWeapon->isKnife()) {
         if (activeWeapon->nextSecondaryAttack() <= memory->globalVars->serverTime() && (cmd->buttons & UserCmd::IN_ATTACK2))
             return false;
     }
@@ -771,33 +889,45 @@ bool AntiAim::canRun(UserCmd* cmd) noexcept
     return true;
 }
 
-// Getters/Setters
-float AntiAim::getLastShotTime()
-{
+// ============================================
+// INPUT HANDLING
+// ============================================
+
+void AntiAim::updateInput() noexcept {
+    config->freestandKey.handleToggle();
+    config->invert.handleToggle();
+    config->fakeFlickOnKey.handleToggle();
+    config->flipFlick.handleToggle();
+    config->manualForward.handleToggle();
+    config->manualBackward.handleToggle();
+    config->manualRight.handleToggle();
+    config->manualLeft.handleToggle();
+}
+
+// ============================================
+// GETTERS/SETTERS
+// ============================================
+
+float AntiAim::getLastShotTime() noexcept {
     return lastShotTime;
 }
 
-bool AntiAim::getIsShooting()
-{
+bool AntiAim::getIsShooting() noexcept {
     return isShooting;
 }
 
-bool AntiAim::getDidShoot()
-{
+bool AntiAim::getDidShoot() noexcept {
     return didShoot;
 }
 
-void AntiAim::setLastShotTime(float shotTime)
-{
+void AntiAim::setLastShotTime(float shotTime) noexcept {
     lastShotTime = shotTime;
 }
 
-void AntiAim::setIsShooting(bool shooting)
-{
+void AntiAim::setIsShooting(bool shooting) noexcept {
     isShooting = shooting;
 }
 
-void AntiAim::setDidShoot(bool shot)
-{
+void AntiAim::setDidShoot(bool shot) noexcept {
     didShoot = shot;
 }

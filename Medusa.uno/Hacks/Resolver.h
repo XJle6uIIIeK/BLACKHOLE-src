@@ -492,8 +492,7 @@ public:
     static std::string getMethodName(ResolveMethod method) noexcept;
     static std::string getModeName(ResolveMode mode) noexcept;
     static std::string getSideName(ResolveSide side) noexcept;
-    static std::string getDebugInfo(int index) noexcept;
-    static std::string getStatisticsInfo(int index) noexcept;
+
 
     void resetStatistics() noexcept;
     void resetPlayerStatistics(int index) noexcept;

@@ -18,6 +18,7 @@
 #include <omp.h>
 #include <thread>
 #include "../xor.h"
+#include "../VectorSIMD.h"
 int maxThreadNum = (std::thread::hardware_concurrency());
 
 struct PenetrationData
@@ -293,6 +294,15 @@ float AimbotFunction::getScanDamage(Entity* entity, const Vector& destination, c
 {
     if (!localPlayer)
         return 0.f;
+
+    const float distance = VectorSIMD::distanceFast(
+        localPlayer->getAbsOrigin(),
+        entity->getAbsOrigin()
+    );
+
+    if (distance > weaponData->range) {
+        return 0.f;
+    }
 
     float damage{ static_cast<float>(weaponData->damage) };
 

@@ -10,6 +10,7 @@
 #include "../Memory.h"
 #include "../Interfaces.h"
 #include "../Config.h"
+#include "../ThreadPool.h"
 #include <sstream>
 #include <iomanip>
 #include <ctime>
@@ -446,35 +447,19 @@ void Resolver::analyzeShot(ShotSnapshot& snapshot) noexcept {
     }
 
     std::ostringstream analysis;
-
-    // Basic info
-    analysis << "Target: " << getPlayerName(snapshot.player_index);
-    analysis << " | Hitbox: " << snapshot.hitbox_targeted;
-    analysis << " | HC: " << static_cast<int>(snapshot.hitchance_predicted) << "%";
-    analysis << " | DMG: " << static_cast<int>(snapshot.damage_predicted);
-
     // Backtrack info
     if (snapshot.used_backtrack) {
         analysis << " | BT: " << snapshot.backtrack_ticks << " ticks";
     }
 
-    // Resolver info
-    analysis << " | Method: " << getMethodName(snapshot.resolver_state.winning_method);
-    analysis << " | Side: " << getSideName(snapshot.resolver_state.side);
-    analysis << " | Conf: " << static_cast<int>(snapshot.resolver_state.confidence * 100) << "%";
-
     // Result
     if (snapshot.got_hurt_event) {
         snapshot.hit_type = determineHitType(snapshot);
-        analysis << " | HIT: " << getHitTypeName(snapshot.hit_type);
         analysis << " | Actual DMG: " << snapshot.actual_damage;
-        analysis << " | Hitgroup: " << snapshot.actual_hitgroup;
-
         logHit(snapshot.player_index, snapshot.hit_type, analysis.str());
     }
     else {
         snapshot.miss_type = determineMissType(snapshot);
-        analysis << " | MISS: " << getMissTypeName(snapshot.miss_type);
 
         // Add specific miss details
         switch (snapshot.miss_type) {
@@ -680,22 +665,6 @@ void Resolver::processMissedShots() noexcept {
         if (snapshot.used_backtrack) {
             data[snapshot.player_index].stats.backtrack_failures++;
         }
-    }
-    else if (!wouldHit && !snapshot.got_hurt_event) {
-        // Spread miss
-        snapshot.miss_type = MissType::SPREAD;
-
-        float spreadDistance = snapshot.impact_position.distTo(snapshot.aim_point);
-
-        std::ostringstream details;
-        details << "Spread distance: " << formatFloat(spreadDistance) << " units";
-        details << " | HC was: " << formatFloat(snapshot.hitchance_predicted) << "%";
-        details << " | Impact missed all hitboxes";
-
-        logMiss(snapshot.player_index, MissType::SPREAD, details.str());
-    }
-    else if (snapshot.got_hurt_event) {
-        // Hit was already logged in event handler
     }
 
     snapshots.pop_front();
@@ -961,6 +930,7 @@ void Resolver::update(Entity* entity, Animations::Players& player) noexcept {
     updateLBYData(entity, info);
     updateAnimStateData(entity, info);
     updatePoseParamData(entity, info);
+
 
     // Detect states
     info.jitter.is_jittering = detectJitter(entity, info);
@@ -2238,119 +2208,6 @@ float Resolver::approachAngle(float target, float value, float speed) noexcept {
         return value - speed;
 
     return target;
-}
-
-// ============================================
-// DEBUG & STATISTICS INFO
-// ============================================
-
-std::string Resolver::getDebugInfo(int index) noexcept {
-    if (index < 1 || index > 64)
-        return "";
-
-    const auto& info = data[index];
-    std::ostringstream ss;
-
-    ss << "Mode: " << getModeName(info.mode);
-    ss << " | Side: " << getSideName(info.side);
-    ss << " | Conf: " << static_cast<int>(info.confidence * 100) << "%";
-    ss << " | Method: " << getMethodName(info.winning_method);
-    ss << " | Jitter: " << (info.jitter.is_jittering ? "Y" : "N");
-    if (info.jitter.pattern_detected) {
-        ss << "(P" << info.jitter.pattern_length << ")";
-    }
-    ss << " | LowD: " << (info.is_low_delta ? "Y" : "N");
-    ss << " | ExtD: " << (info.extended_desync ? "Y" : "N");
-    ss << " | FW: " << (info.is_fake_walking ? "Y" : "N");
-    ss << " | FD: " << (info.is_fake_ducking ? "Y" : "N");
-    ss << " | Miss: " << info.misses;
-    ss << " | Hit: " << info.hits;
-
-    return ss.str();
-}
-
-std::string Resolver::getStatisticsInfo(int index) noexcept {
-    if (index < 1 || index > 64)
-        return "";
-
-    const auto& stats = data[index].stats;
-    std::ostringstream ss;
-
-    ss << "=== Player Statistics ===" << std::endl;
-    ss << "Total Shots: " << stats.total_shots << std::endl;
-
-    float accuracy = stats.total_shots > 0
-        ? static_cast<float>(stats.hits) / stats.total_shots * 100.f
-        : 0.f;
-    ss << "Hits: " << stats.hits << " (" << formatFloat(accuracy) << "%)" << std::endl;
-    ss << "Misses: " << stats.misses << std::endl;
-    ss << std::endl;
-
-    ss << "--- Side Statistics ---" << std::endl;
-    int leftTotal = stats.left_hits + stats.left_misses;
-    int rightTotal = stats.right_hits + stats.right_misses;
-    int centerTotal = stats.center_hits + stats.center_misses;
-
-    float leftAcc = leftTotal > 0 ? static_cast<float>(stats.left_hits) / leftTotal * 100.f : 0.f;
-    float rightAcc = rightTotal > 0 ? static_cast<float>(stats.right_hits) / rightTotal * 100.f : 0.f;
-    float centerAcc = centerTotal > 0 ? static_cast<float>(stats.center_hits) / centerTotal * 100.f : 0.f;
-
-    ss << "Left: " << stats.left_hits << "/" << leftTotal << " (" << formatFloat(leftAcc) << "%)" << std::endl;
-    ss << "Right: " << stats.right_hits << "/" << rightTotal << " (" << formatFloat(rightAcc) << "%)" << std::endl;
-    ss << "Center: " << stats.center_hits << "/" << centerTotal << " (" << formatFloat(centerAcc) << "%)" << std::endl;
-    ss << std::endl;
-
-    ss << "--- Backtrack ---" << std::endl;
-    ss << "Attempts: " << stats.backtrack_attempts << std::endl;
-    ss << "Successes: " << stats.backtrack_successes << std::endl;
-    ss << "Failures: " << stats.backtrack_failures << std::endl;
-    if (stats.backtrack_attempts > 0) {
-        float btAcc = static_cast<float>(stats.backtrack_successes) / stats.backtrack_attempts * 100.f;
-        ss << "Success Rate: " << formatFloat(btAcc) << "%" << std::endl;
-    }
-    ss << std::endl;
-
-    ss << "--- Method Statistics ---" << std::endl;
-    for (int i = 0; i < static_cast<int>(ResolveMethod::COUNT); i++) {
-        int attempts = stats.method_attempts[i];
-        int successes = stats.method_successes[i];
-        if (attempts > 0) {
-            float successRate = static_cast<float>(successes) / attempts * 100.f;
-            ss << getMethodName(static_cast<ResolveMethod>(i)) << ": "
-                << successes << "/" << attempts << " (" << formatFloat(successRate) << "%)" << std::endl;
-        }
-    }
-    ss << std::endl;
-
-    ss << "--- Miss Types ---" << std::endl;
-    for (int i = 1; i < static_cast<int>(MissType::COUNT); i++) {
-        if (stats.miss_types[i] > 0) {
-            ss << getMissTypeName(static_cast<MissType>(i)) << ": " << stats.miss_types[i] << std::endl;
-        }
-    }
-    ss << std::endl;
-
-    ss << "--- Hit Types ---" << std::endl;
-    for (int i = 1; i < static_cast<int>(HitType::COUNT); i++) {
-        if (stats.hit_types[i] > 0) {
-            ss << getHitTypeName(static_cast<HitType>(i)) << ": " << stats.hit_types[i] << std::endl;
-        }
-    }
-    ss << std::endl;
-
-    ss << "--- Streaks ---" << std::endl;
-    ss << "Max Consecutive Hits: " << stats.max_consecutive_hits << std::endl;
-    ss << "Max Consecutive Misses: " << stats.max_consecutive_misses << std::endl;
-    ss << "Current Streak: ";
-    if (stats.consecutive_hits > 0) {
-        ss << "+" << stats.consecutive_hits << " hits";
-    }
-    else {
-        ss << "-" << stats.consecutive_misses << " misses";
-    }
-    ss << std::endl;
-
-    return ss.str();
 }
 
 // ============================================

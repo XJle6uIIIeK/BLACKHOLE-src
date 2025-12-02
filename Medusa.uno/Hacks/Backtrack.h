@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "../SDK/Vector.h"
 #include "../SDK/matrix3x4.h"

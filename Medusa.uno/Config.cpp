@@ -259,7 +259,6 @@ static void from_json(const json& j, Config::Tickbase& t)
     read(j, "Doubletap", t.doubletap);
     read(j, "Hideshots", t.hideshots);
     read(j, "Teleport", t.teleport);
-    read(j, "Fast Recharge", t.fast_recharge);
     read(j, "Defensive", t.defensive_dt);
 
 }
@@ -1309,7 +1308,6 @@ static void to_json(json& j, const Config::Tickbase& o, const Config::Tickbase& 
     WRITE("Doubletap", doubletap);
     WRITE("Hideshots", hideshots);
     WRITE("Teleport", teleport);
-    WRITE("Fast Recharge", fast_recharge);
     WRITE("Defensive", defensive_dt);
 }
 

@@ -259,6 +259,8 @@
     <ClInclude Include="Hacks\Clantag.h" />
     <ClInclude Include="Hacks\cheat_revealer.hpp" />
     <ClInclude Include="SDK\structs.hpp" />
+    <ClInclude Include="ThreadPool.h" />
+    <ClInclude Include="VectorSIMD.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="includes.hpp" />

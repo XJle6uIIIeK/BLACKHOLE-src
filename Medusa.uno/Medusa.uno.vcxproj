@@ -262,7 +262,9 @@
     <ClInclude Include="StringPool.h" />
     <ClInclude Include="Texture.h" />
     <ClInclude Include="Threading.h" />
+    <ClInclude Include="ThreadPool.h" />
     <ClInclude Include="Vector2D.hpp" />
+    <ClInclude Include="VectorSIMD.h" />
     <ClInclude Include="Vertex.hpp" />
     <ClInclude Include="xor.h" />
   </ItemGroup>

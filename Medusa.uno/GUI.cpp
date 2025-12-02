@@ -734,6 +734,7 @@ void renderRageBotWindow(ImDrawList* drawList) noexcept
         }
     }
     ImGui::hotkey2(skCrypt("Force baim"), config->forceBaim);
+    ImGui::hotkey2(skCrypt("Force Shot"), config->forceShotKey);
     ImGui::Text(skCrypt("Exploits"));
     ImGui::PushID(skCrypt("Doubletap"));
     ImGui::hotkey2(skCrypt("Double-tap"), config->tickbase.doubletap);
@@ -746,7 +747,6 @@ void renderRageBotWindow(ImDrawList* drawList) noexcept
     if (ImGui::BeginPopup(""))
     {
         ImGui::Checkbox(skCrypt("Defensive"), &config->tickbase.defensive_dt);
-        ImGui::Checkbox(skCrypt("Fast Recharge"), &config->tickbase.fast_recharge);
         ImGui::EndPopup();
     }
     ImGui::PopID();
@@ -782,6 +782,10 @@ void renderRageBotWindow(ImDrawList* drawList) noexcept
     {
         ImGui::SliderInt(skCrypt("Hitchance override"), &config->rageBot[RcurrentCategory].OvrHitChance, 0, 100, "%d");
     }
+    ImGui::Checkbox(skCrypt("prefer Safe Points"), &config->rageBot[RcurrentCategory].preferSafePoints);
+    ImGui::Checkbox(skCrypt("force Safe Points"), &config->rageBot[RcurrentCategory].forceSafePoints);
+    ImGui::Checkbox(skCrypt("Delay Shot"), &config->rageBot[RcurrentCategory].delayShot);
+
     ImGui::Checkbox(skCrypt("Backtrack"), &config->backtrack.enabled);
     if (config->backtrack.enabled)
     {
