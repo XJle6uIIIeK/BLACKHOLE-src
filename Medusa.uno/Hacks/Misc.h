@@ -93,7 +93,6 @@ namespace Misc
     void recoilCrosshair() noexcept;
     void spotifyInd() noexcept;
     void watermark() noexcept;
-    void infoInd() noexcept;
     void watermarkSurface() noexcept;
     void prepareRevolver(UserCmd*) noexcept;
     void fastPlant(UserCmd*) noexcept;

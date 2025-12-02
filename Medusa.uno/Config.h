@@ -57,6 +57,11 @@ public:
         int multiPointBody{ 0 };
         int minDamage{ 1 };
         int minDamageOverride{ 1 };
+        bool preferSafePoints{ true };
+        bool forceSafePoints{ false };
+        bool unsafeHitbox{ false };
+        bool delayShot{ true };
+        int delayShotTicks{ 3 };
     };
     std::array<Ragebot, 11> rageBot;
     struct LegitbotGlobal {
@@ -95,6 +100,7 @@ public:
     KeyBind ragebotKey{ std::string("Ragebot") };
     KeyBind minDamageOverrideKey{ std::string("Damage override"), KeyMode::Off };
     KeyBind forceBaim{ std::string("Force body aim"), KeyMode::Off };
+    KeyBind forceShotKey{ std::string("Force Shot"), KeyMode::Off };
 
     struct Fakelag {
         int mode = 0;

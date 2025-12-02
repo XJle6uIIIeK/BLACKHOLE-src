@@ -139,6 +139,17 @@ void Misc::oppositeHandKnife(FrameStage stage) noexcept
     }
 }
 
+// Вспомогательная функция для получения клавиши
+static inline const char* getKeyLabel(int buttons, int buttonFlag,
+    const std::string& keyName,
+    const char* defaultKey) noexcept
+{
+    if (buttons & buttonFlag) {
+        return keyName.empty() ? defaultKey : keyName.c_str();
+    }
+    return nullptr;
+}
+
 void Misc::drawKeyDisplay(ImDrawList* drawList) noexcept
 {
     if (!config->misc.keyBoardDisplay.enabled)
@@ -147,51 +158,59 @@ void Misc::drawKeyDisplay(ImDrawList* drawList) noexcept
     if (!localPlayer || !localPlayer->isAlive())
         return;
 
-    int screenSizeX, screenSizeY;
-    interfaces->engine->getScreenSize(screenSizeX, screenSizeY);
-    const float Ypos = static_cast<float>(screenSizeY) * config->misc.keyBoardDisplay.position;
+    // Ранний выход если нет нажатых клавиш
+    if (currentButtons == 0 && !config->misc.keyBoardDisplay.showKeyTiles)
+        return;
 
-    std::string keys[3][2];
-    if (config->misc.keyBoardDisplay.showKeyTiles)
-    {
-        for (int i = 0; i < 3; i++)
-        {
-            for (int j = 0; j < 2; j++)
-            {
+    const auto [screenWidth, screenHeight] = interfaces->surface->getScreenSize();
+    const float yPos = static_cast<float>(screenHeight) * config->misc.keyBoardDisplay.position;
+
+    // Массив клавиш [колонка][ряд]
+    const char* keys[3][2] = { nullptr };
+
+    // Заполнить плитки если нужно
+    if (config->misc.keyBoardDisplay.showKeyTiles) {
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 2; j++) {
                 keys[i][j] = "_";
             }
         }
     }
 
-    if (currentButtons & UserCmd::IN_DUCK)
-        keys[0][0] = skCrypt("C");
-    if (currentButtons & UserCmd::IN_FORWARD)
-        keys[1][0] = currentForwardKey;
-    if (currentButtons & UserCmd::IN_JUMP)
-        keys[2][0] = skCrypt("J");
-    if (currentButtons & UserCmd::IN_MOVELEFT)
-        keys[0][1] = currentLeftKey;
-    if (currentButtons & UserCmd::IN_BACK)
-        keys[1][1] = currentBackKey;
-    if (currentButtons & UserCmd::IN_MOVERIGHT)
-        keys[2][1] = currentRightKey;
+    // Заполнить нажатые клавиши
+    keys[0][0] = getKeyLabel(currentButtons, UserCmd::IN_DUCK, "", "C");
+    keys[1][0] = getKeyLabel(currentButtons, UserCmd::IN_FORWARD, currentForwardKey, "W");
+    keys[2][0] = getKeyLabel(currentButtons, UserCmd::IN_JUMP, "", "J");
+    keys[0][1] = getKeyLabel(currentButtons, UserCmd::IN_MOVELEFT, currentLeftKey, "A");
+    keys[1][1] = getKeyLabel(currentButtons, UserCmd::IN_BACK, currentBackKey, "S");
+    keys[2][1] = getKeyLabel(currentButtons, UserCmd::IN_MOVERIGHT, currentRightKey, "D");
 
-    const float positions[3] =
-    {
-       -35.0f, 0.0f, 35.0f
-    };
+    // Позиции колонок
+    static constexpr float positions[3] = { -35.0f, 0.0f, 35.0f };
+
+    // Вычислить цвета один раз
+    const ImU32 shadowColor = Helpers::calculateColor(
+        Color4{ 0.0f, 0.0f, 0.0f, config->misc.keyBoardDisplay.color.color[3] });
+    const ImU32 mainColor = Helpers::calculateColor(config->misc.keyBoardDisplay.color);
 
     ImGui::PushFont(gui->getTahoma28Font());
-    for (int i = 0; i < 3; i++)
-    {
-        for (int j = 0; j < 2; j++)
-        {
-            if (keys[i][j] == "")
+
+    const float centerX = static_cast<float>(screenWidth) / 2.0f;
+
+    for (int col = 0; col < 3; col++) {
+        for (int row = 0; row < 2; row++) {
+            const char* key = keys[col][row];
+            if (!key)
                 continue;
 
-            const auto size = ImGui::CalcTextSize(keys[i][j].c_str());
-            drawList->AddText(ImVec2{ (static_cast<float>(screenSizeX) / 2 - size.x / 2 + positions[i]) + 1, (Ypos + (j * 25)) + 1 }, Helpers::calculateColor(Color4{ 0.0f, 0.0f, 0.0f, config->misc.keyBoardDisplay.color.color[3] }), keys[i][j].c_str());
-            drawList->AddText(ImVec2{ static_cast<float>(screenSizeX) / 2 - size.x / 2 + positions[i], Ypos + (j * 25) }, Helpers::calculateColor(config->misc.keyBoardDisplay.color), keys[i][j].c_str());
+            const auto textSize = ImGui::CalcTextSize(key);
+            const float x = centerX - textSize.x / 2.0f + positions[col];
+            const float y = yPos + (row * 25.0f);
+
+            // Тень
+            drawList->AddText(ImVec2{ x + 1.0f, y + 1.0f }, shadowColor, key);
+            // Основной текст
+            drawList->AddText(ImVec2{ x, y }, mainColor, key);
         }
     }
 
@@ -206,55 +225,102 @@ void Misc::drawVelocity(ImDrawList* drawList) noexcept
     if (!localPlayer)
         return;
 
-    const auto entity = localPlayer->isAlive() ? localPlayer.get() : localPlayer->getObserverTarget();
+    const auto entity = localPlayer->isAlive()
+        ? localPlayer.get()
+        : localPlayer->getObserverTarget();
+
     if (!entity)
         return;
 
-    int screenSizeX, screenSizeY;
-    interfaces->engine->getScreenSize(screenSizeX, screenSizeY);
-    const float Ypos = static_cast<float>(screenSizeY) * config->misc.velocity.position;
+    const auto [screenWidth, screenHeight] = interfaces->surface->getScreenSize();
+    const float yPos = static_cast<float>(screenHeight) * config->misc.velocity.position;
 
-    static float colorTime = 0.f;
-    static float takeOffTime = 0.f;
-
-    static auto lastVelocity = 0;
-    const auto velocity = static_cast<int>(round(entity->velocity().length2D()));
-
-    static auto takeOffVelocity = 0;
+    static float colorTime = 0.0f;
+    static float takeOffTime = 0.0f;
+    static int lastVelocity = 0;
+    static int takeOffVelocity = 0;
     static bool lastOnGround = true;
+
+    const int velocity = static_cast<int>(std::round(entity->velocity().length2D()));
     const bool onGround = entity->flags() & 1;
-    if (lastOnGround && !onGround)
-    {
+
+    // Определить взлет
+    if (lastOnGround && !onGround) {
         takeOffVelocity = velocity;
-        takeOffTime = memory->globalVars->realtime + 2.f;
+        takeOffTime = memory->globalVars->realtime + 2.0f;
     }
 
     const bool shouldDrawTakeOff = !onGround || (takeOffTime > memory->globalVars->realtime);
-    const std::string finalText = std::to_string(velocity);
 
-    const Color4 trueColor = config->misc.velocity.color.enabled ? Color4{ config->misc.velocity.color.color[0], config->misc.velocity.color.color[1], config->misc.velocity.color.color[2], config->misc.velocity.alpha, config->misc.velocity.color.rainbowSpeed, config->misc.velocity.color.rainbow }
-        : (velocity == lastVelocity ? Color4{ 1.0f, 0.78f, 0.34f, config->misc.velocity.alpha } : velocity < lastVelocity ? Color4{ 1.0f, 0.46f, 0.46f, config->misc.velocity.alpha } : Color4{ 0.11f, 1.0f, 0.42f, config->misc.velocity.alpha });
+    // Определить цвет скорости
+    Color4 velocityColor;
+    if (config->misc.velocity.color.enabled) {
+        velocityColor = Color4{
+            config->misc.velocity.color.color[0],
+            config->misc.velocity.color.color[1],
+            config->misc.velocity.color.color[2],
+            config->misc.velocity.alpha,
+            config->misc.velocity.color.rainbowSpeed,
+            config->misc.velocity.color.rainbow
+        };
+    }
+    else {
+        if (velocity == lastVelocity) {
+            velocityColor = Color4{ 1.0f, 0.78f, 0.34f, config->misc.velocity.alpha };
+        }
+        else if (velocity < lastVelocity) {
+            velocityColor = Color4{ 1.0f, 0.46f, 0.46f, config->misc.velocity.alpha };
+        }
+        else {
+            velocityColor = Color4{ 0.11f, 1.0f, 0.42f, config->misc.velocity.alpha };
+        }
+    }
+
+    const std::string velocityText = std::to_string(velocity);
+    const ImU32 shadowColor = Helpers::calculateColor(
+        Color4{ 0.0f, 0.0f, 0.0f, config->misc.velocity.alpha });
+    const ImU32 mainColor = Helpers::calculateColor(velocityColor);
 
     ImGui::PushFont(gui->getTahoma28Font());
 
-    const auto size = ImGui::CalcTextSize(finalText.c_str());
-    drawList->AddText(ImVec2{ (static_cast<float>(screenSizeX) / 2 - size.x / 2) + 1, Ypos + 1.0f }, Helpers::calculateColor(Color4{ 0.0f, 0.0f, 0.0f, config->misc.velocity.alpha }), finalText.c_str());
-    drawList->AddText(ImVec2{ static_cast<float>(screenSizeX) / 2 - size.x / 2, Ypos }, Helpers::calculateColor(trueColor), finalText.c_str());
+    const auto textSize = ImGui::CalcTextSize(velocityText.c_str());
+    const float centerX = static_cast<float>(screenWidth) / 2.0f;
+    const float textX = centerX - textSize.x / 2.0f;
 
-    if (shouldDrawTakeOff)
-    {
-        const std::string bottomText = "(" + std::to_string(takeOffVelocity) + ")";
-        const Color4 bottomTrueColor = config->misc.velocity.color.enabled ? Color4{ config->misc.velocity.color.color[0], config->misc.velocity.color.color[1], config->misc.velocity.color.color[2], config->misc.velocity.alpha, config->misc.velocity.color.rainbowSpeed, config->misc.velocity.color.rainbow }
-            : (takeOffVelocity <= 250.0f ? Color4{ 0.75f, 0.75f, 0.75f, config->misc.velocity.alpha } : Color4{ 0.11f, 1.0f, 0.42f, config->misc.velocity.alpha });
-        const auto bottomSize = ImGui::CalcTextSize(bottomText.c_str());
-        drawList->AddText(ImVec2{ (static_cast<float>(screenSizeX) / 2 - bottomSize.x / 2) + 1, Ypos + 20.0f + 1 }, Helpers::calculateColor(Color4{ 0.0f, 0.0f, 0.0f, config->misc.velocity.alpha }), bottomText.c_str());
-        drawList->AddText(ImVec2{ static_cast<float>(screenSizeX) / 2 - bottomSize.x / 2, Ypos + 20.0f }, Helpers::calculateColor(bottomTrueColor), bottomText.c_str());
+    // Основная скорость
+    drawList->AddText(ImVec2{ textX + 1.0f, yPos + 1.0f }, shadowColor, velocityText.c_str());
+    drawList->AddText(ImVec2{ textX, yPos }, mainColor, velocityText.c_str());
+
+    // Скорость взлета
+    if (shouldDrawTakeOff) {
+        const std::string takeOffText = "(" + std::to_string(takeOffVelocity) + ")";
+
+        Color4 takeOffColor;
+        if (config->misc.velocity.color.enabled) {
+            takeOffColor = velocityColor;
+        }
+        else {
+            takeOffColor = (takeOffVelocity <= 250)
+                ? Color4{ 0.75f, 0.75f, 0.75f, config->misc.velocity.alpha }
+            : Color4{ 0.11f, 1.0f, 0.42f, config->misc.velocity.alpha };
+        }
+
+        const auto takeOffTextSize = ImGui::CalcTextSize(takeOffText.c_str());
+        const float takeOffX = centerX - takeOffTextSize.x / 2.0f;
+        const float takeOffY = yPos + 20.0f;
+
+        const ImU32 takeOffMainColor = Helpers::calculateColor(takeOffColor);
+
+        drawList->AddText(ImVec2{ takeOffX + 1.0f, takeOffY + 1.0f },
+            shadowColor, takeOffText.c_str());
+        drawList->AddText(ImVec2{ takeOffX, takeOffY },
+            takeOffMainColor, takeOffText.c_str());
     }
 
     ImGui::PopFont();
 
-    if (colorTime <= memory->globalVars->realtime)
-    {
+    // Обновить состояние
+    if (colorTime <= memory->globalVars->realtime) {
         colorTime = memory->globalVars->realtime + 0.1f;
         lastVelocity = velocity;
     }
@@ -2141,7 +2207,7 @@ void Misc::Indictators() noexcept
                 }
             }
         }
-        if ((config->misc.indicators.toShow & 1 << IDoubleTap) == 1 << IDoubleTap)
+        /*if ((config->misc.indicators.toShow & 1 << IDoubleTap) == 1 << IDoubleTap)
         {
             if (config->tickbase.doubletap.isActive())
             {
@@ -2161,7 +2227,7 @@ void Misc::Indictators() noexcept
                 Render::drawText(hooks->IndFont, color, ImVec2{ 23, (float)(height - 340 - h) }, indicator.c_str());
                 h += 36;
             }
-        }
+        }*/
         if ((config->misc.indicators.toShow & 1 << IOnShot) == 1 << IOnShot)
         {
             if (config->tickbase.hideshots.isActive())
@@ -3735,79 +3801,6 @@ void Misc::watermark() noexcept
             text.str().c_str()
         );
         offsetSpot = true;
-        ImGui::PopFont();
-    }
-    ImGui::End();
-}
-
-void Misc::infoInd() noexcept
-{
-    if (!config->misc.wm.showInfo)
-        return;
-
-    const auto [screenWidth, screenHeight] = interfaces->surface->getScreenSize();
-    auto draw_list = ImGui::GetBackgroundDrawList();
-
-    //INFO
-    std::string infotxt = "";
-    infotxt = "FL " + std::to_string(Fakelag::latest_choked_packets);
-    if (config->tickbase.doubletap.isActive())
-        infotxt += " | DT";
-
-    if (config->tickbase.hideshots.isActive())
-        infotxt += " | HS";
-
-    infotxt += " | TGT " + Ragebot::latest_player;
-    //infotxt += " | HIT / MISS " + std::to_string(Resolver::hits) + "/" + std::to_string(Resolver::misses);
-    //infotxt += " (" + std::to_string(Resolver::hit_rate) + "%)";
-
-
-    ImGui::Begin(c_xor("##info"), NULL, ImGuiWindowFlags_::ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_::ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_::ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoInputs);
-    {
-        ImGui::PushFont(gui->getFIconsFont());
-        // get window pos
-        auto p = ImGui::GetWindowPos();
-
-        // set watermark color
-        auto bg_clr = ImColor(0.f, 0.f, 0.f, config->menu.transparency / 100);
-        auto line_clr = Helpers::calculateColor(config->menu.accentColor);
-        auto text_clr = ImColor(255, 255, 255, 255);
-        auto glow = Helpers::calculateColor(config->menu.accentColor, 0.0f);
-        auto glow1 = Helpers::calculateColor(config->menu.accentColor, config->menu.accentColor.color[3] * 0.5f);
-        auto glow2 = Helpers::calculateColor(config->menu.accentColor);
-        // draw bg
-        auto calcText = ImGui::CalcTextSize(infotxt.c_str());
-        ImGui::SetWindowPos({ screenWidth - calcText.x - 19.f, 9 + (config->misc.wm.enabled ? calcText.y * 2 + 5 : 0) });
-        draw_list->AddRectFilled(ImVec2(p.x - 4, p.y - 2), ImVec2(p.x + calcText.x + 14, p.y + calcText.y * 2 - 4), bg_clr, config->menu.windowStyle == 0 ? 5.f : 0.0f);
-        // draw line
-        if (config->menu.windowStyle == 0)
-            draw_list->AddRect(ImVec2(p.x - 5, p.y - 3), ImVec2(p.x + calcText.x + 15, p.y + calcText.y * 2 - 3), line_clr, 5.f, 0, 1.5f);
-        else if (config->menu.windowStyle == 1)
-            draw_list->AddLine({ p.x - 4, p.y - 2 - 1 }, { p.x + calcText.x + 14, p.y - 2 - 1 }, line_clr, 2.f);
-        else if (config->menu.windowStyle == 2)
-            draw_list->AddLine({ p.x - 4, p.y + calcText.y * 2 - 3 }, { p.x + calcText.x + 14, p.y + calcText.y * 2 - 5 }, line_clr, 2.f);
-        else if (config->menu.windowStyle == 3)
-            draw_list->AddLine({ p.x - 4, p.y - 2 - 1 }, { p.x + calcText.x + 14, p.y - 2 - 1 }, line_clr, 2.f);
-        else if (config->menu.windowStyle == 4)
-            draw_list->AddLine({ p.x - 4, p.y - 2 - 1 }, { p.x + calcText.x + 14, p.y - 2 - 1 }, line_clr, 2.f);
-        if (config->menu.windowStyle == 3)
-            draw_list->AddRectFilledMultiColor(ImVec2(p.x - 4, p.y - 2), ImVec2(p.x + calcText.x + 14, p.y + calcText.y - 2),
-                glow1,
-                glow1,
-                glow,
-                glow);
-        else if (config->menu.windowStyle == 4)
-        {
-            draw_list->AddRectFilledMultiColor(ImVec2(p.x - 4, p.y - 2), ImVec2(p.x - 2, p.y + calcText.y * 2 - 4), glow2, glow2, glow, glow);
-            draw_list->AddRectFilledMultiColor(ImVec2(p.x + calcText.x + 12, p.y - 2), ImVec2(p.x + calcText.x + 14, p.y + calcText.y * 2 - 4), glow2, glow2, glow, glow);
-        }
-
-        // draw text
-        draw_list->AddText(
-            ImVec2(p.x + 5, p.y + calcText.y / 2 - 3.f),
-            text_clr,
-            infotxt.c_str()
-        );
         ImGui::PopFont();
     }
     ImGui::End();

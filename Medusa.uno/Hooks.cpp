@@ -312,7 +312,6 @@ static HRESULT __stdcall present(IDirect3DDevice9* device, const RECT* src, cons
         Visuals::drawMolotovTimer(ImGui::GetBackgroundDrawList());
         Misc::watermark();
         //Misc::spotifyInd();
-        Misc::infoInd();
         Misc::aaArrows(ImGui::GetBackgroundDrawList());
         Misc::drawAutoPeek(ImGui::GetBackgroundDrawList());
         Misc::drawKeyDisplay(ImGui::GetBackgroundDrawList());
@@ -1561,272 +1560,103 @@ static void writeUsercmd(bufferWrite* buffer, UserCmd* toCmd, UserCmd* fromCmd) 
     }
 }
 
-void handleBreakLC(const std::uintptr_t ecx, const std::uintptr_t edx, const int slot, bufferWrite* buffer, int& from, int& to, clMsgMove* move_msg)
-{
-    EnginePrediction::NetvarData netvars{ };
-    auto shift_amount = Tickbase::DeftargetTickShift;
-    Tickbase::DeftargetTickShift = 0;
+// ============================================
+// CONSTANTS
+// ============================================
 
-    const auto v86 = min(move_msg->newCommands + Tickbase::ticksAllowedForProcessing, 16);
+namespace {
+    constexpr int MAX_NEW_COMMANDS = 62;
+    constexpr int MAX_BACKUP_COMMANDS = 8;
+    constexpr int TICK_MAGIC_NUMBER = 200;
+    constexpr int MAX_PROCESS_TICKS = 16;
+    constexpr unsigned int BLOCKED_BUTTONS = 4290707449u;
 
-    int v69{};
+    // Shift state tracking
+    struct ShiftState {
+        int shiftAmount = 0;
+        int adjustedTickbase = 0;
+        bool overrideTickbase = false;
+        bool restoreTickbase = false;
+        Vector targetMove{};
+        bool isProcessing = false;
+    };
 
-    const auto v70 = v86 - move_msg->newCommands;
-    if (v70 >= 0)
-        v69 = v70;
-
-    Tickbase::ticksAllowedForProcessing = v69;
-
-    const auto old_new_cmds = move_msg->newCommands;
-
-    move_msg->newCommands = std::clamp(move_msg->newCommands + shift_amount, 1, 62);
-    move_msg->backupCommands = 0;
-
-    const auto next_cmd_number = memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands + 1;
-
-    for (to = next_cmd_number - old_new_cmds + 1; to <= next_cmd_number; ++to)
-    {
-        if (!hooks->client.callOriginal<bool, 24, int, bufferWrite*, int, int, bool>(slot, buffer, from, to, move_msg))
-            return;
-
-        from = to;
-    }
-
-    for (auto i = memory->clientState->lastOutgoingCommand + 1; i <= next_cmd_number; ++i)
-        netvars.tickbase = shift_amount;
-
-    const auto user_cmd = memory->input->getUserCmd(slot, from);
-    if (!user_cmd)
-        return;
-
-    auto from_user_cmd = *user_cmd, to_user_cmd = *user_cmd;
-
-    if (shift_amount)
-    {
-        ++to_user_cmd.commandNumber;
-        to_user_cmd.tickCount += 200;
-
-        do
-        {
-            writeUsercmd(buffer, &to_user_cmd, &from_user_cmd);
-
-            from_user_cmd = to_user_cmd;
-
-            ++to_user_cmd.commandNumber;
-            --shift_amount;
-        } while (shift_amount);
-    }
+    ShiftState g_shiftState{};
 }
 
+static clMsgMove* getClMsgMove() noexcept {
+    // Get move message from stack
+    const auto returnAddr = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
+    const auto stackPtr = *reinterpret_cast<std::uintptr_t*>(returnAddr - sizeof(std::uintptr_t));
 
-Vector m_move{};
-int m_adjusted_tick_base{}, m_shift_amount{};
-bool m_override_tick_base{}, m_restore_tick_base{};
+    if (!stackPtr)
+        return nullptr;
 
-void handleOtherShift(const std::uintptr_t ecx, const std::uintptr_t edx, const int slot, bufferWrite* buffer, int& from, int& to, clMsgMove* move_msg)
-{
-    auto shift_amount = Tickbase::targetTickShift;
-    Tickbase::targetTickShift = 0;
-
-    const auto v86 = min(move_msg->newCommands + Tickbase::ticksAllowedForProcessing, 16);
-
-    int v69{};
-
-    auto v70 = v86 - move_msg->newCommands;
-    v70 -= shift_amount;
-
-    if (v70 >= 0)
-        v69 = v70;
-
-    Tickbase::ticksAllowedForProcessing = v69;
-
-    const auto old_new_cmds = move_msg->newCommands;
-
-    move_msg->newCommands = std::clamp(move_msg->newCommands + shift_amount, 1, 62);
-    move_msg->backupCommands = 0;
-
-    auto first_tick_base = Tickbase::adjust_tick_base(old_new_cmds, move_msg->newCommands, shift_amount);
-    const auto next_cmd_number = memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands + 1;
-
-    for (to = next_cmd_number - old_new_cmds + 1; to <= next_cmd_number; ++to)
-    {
-        if (!hooks->client.callOriginal<bool, 24, int, bufferWrite*, int, int, bool>(slot, buffer, from, to, true))
-            return;
-
-        from = to;
-    }
-
-    for (auto i = memory->clientState->lastOutgoingCommand + 1; i <= next_cmd_number; ++i)
-    {
-        m_shift_amount = shift_amount;
-        m_override_tick_base = true;
-        m_adjusted_tick_base = first_tick_base++;
-    }
-
-    const auto user_cmd = memory->input->getUserCmd(slot, from);
-    if (!user_cmd)
-        return;
-
-    auto from_user_cmd = *user_cmd, to_user_cmd = *user_cmd;
-
-    ++to_user_cmd.commandNumber;
-
-    interfaces->prediction->previousStartFrame = -1;
-    interfaces->prediction->split->commandsPredicted = 0;
-
-    Vector target_move{};
-
-    if (config->tickbase.doubletap.isActive())
-    {
-        ++memory->clientState->chokedCommands;
-        ++memory->clientState->netChannel->chokedPackets;
-        ++memory->clientState->netChannel->outSequenceNr;
-
-        if (config->tickbase.defensive_dt)
-        {
-            target_move = { m_move.x, m_move.y };
-
-            if (std::abs(m_move.x) > 10.f)
-                target_move.x = std::copysign(450.f, m_move.x);
-
-            if (std::abs(m_move.y) > 10.f)
-                target_move.y = std::copysign(450.f, m_move.y);
-        }
-
-        int v80{};
-
-        do
-        {
-            interfaces->prediction->update(memory->clientState->deltaTick, memory->clientState->deltaTick > 0, memory->clientState->lastCommandAck, memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands);
-
-            to_user_cmd.buttons &= ~4290707449u;
-            to_user_cmd.sidemove = {};
-            to_user_cmd.forwardmove = {};
-
-            if (localPlayer->isAlive())
-            {
-                if (!(to_user_cmd.buttons & UserCmd::IN_JUMP) && localPlayer->flags() & FL_ONGROUND)
-                {
-                    int v54{};
-                    if ((shift_amount - 2) >= 0)
-                        v54 = shift_amount - 2;
-
-                    if (v80 >= v54)
-                    {
-                        to_user_cmd.sidemove = target_move.x;
-                        to_user_cmd.sidemove = target_move.y;
-
-                        to_user_cmd.forwardmove = target_move.x;
-                        to_user_cmd.forwardmove = target_move.y;
-                    }
-                }
-            }
-
-            memory->input->commands[to_user_cmd.commandNumber % 150] = to_user_cmd;
-            memory->input->verifiedCommands[to_user_cmd.commandNumber % 150] = { to_user_cmd, to_user_cmd.getChecksum() };
-
-            writeUsercmd(buffer, &to_user_cmd, &from_user_cmd);
-
-            m_override_tick_base = true;
-            m_adjusted_tick_base = first_tick_base++;
-
-            ++v80;
-
-            if (v80 >= shift_amount)
-                memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands + 1;
-            else
-            {
-                ++memory->clientState->chokedCommands;
-                ++memory->clientState->netChannel->chokedPackets;
-                ++memory->clientState->netChannel->outSequenceNr;
-            }
-
-            from_user_cmd = to_user_cmd;
-
-            ++to_user_cmd.commandNumber;
-        } while (v80 < shift_amount);
-    }
-    else
-    {
-        to_user_cmd.tickCount *= 200;
-
-        do
-        {
-            writeUsercmd(buffer, &to_user_cmd, &from_user_cmd);
-
-            from_user_cmd = to_user_cmd;
-
-            ++to_user_cmd.commandNumber;
-
-            --shift_amount;
-        } while (shift_amount);
-    }
+    return reinterpret_cast<clMsgMove*>(stackPtr - 0x58u);
 }
 
+static void updateTicksAllowed(clMsgMove* moveMsg, int shiftAmount) noexcept {
+    if (!moveMsg)
+        return;
 
-static bool __fastcall writeUsercmdDeltaToBuffer(
-    const std::uintptr_t ecx,
-    const std::uintptr_t edx,
-    const int slot,
-    bufferWrite* const buffer,
-    int from,
-    int to,
-    const bool is_new_cmd) noexcept
-{
-    // Если нет shift или teleport выключен - используем оригинал
-    if (Tickbase::getTickshift() <= 0 || config->tickbase.teleport)
-        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, is_new_cmd);
+    const int maxShift = (std::min)(moveMsg->newCommands + Tickbase::getTicksCharged(), MAX_PROCESS_TICKS);
+    int newAllowed = maxShift - moveMsg->newCommands - shiftAmount;
 
-    const int shiftAmount = Tickbase::getTickshift();
-    Tickbase::resetTickshift();
+    // Update tickbase data
+    Tickbase::data.ticksCharged = (std::max)(0, newAllowed);
+}
 
+static int calculateAdjustedTickbase(int oldNewCmds, int totalNewCmds, int shiftAmount) noexcept {
     if (!localPlayer)
-        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, is_new_cmd);
+        return 0;
 
-    // Получаем move message
-    const auto move_msg = reinterpret_cast<clMsgMove*>(
-        *reinterpret_cast<std::uintptr_t*>(
-            reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress()) - sizeof(std::uintptr_t)
-            ) - 0x58u
-        );
+    return Tickbase::adjustTickbase(oldNewCmds, totalNewCmds, shiftAmount);
+}
 
-    if (!move_msg)
-        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, is_new_cmd);
+static bool handleStandardShift(
+    int slot,
+    bufferWrite* buffer,
+    int& from,
+    int& to,
+    clMsgMove* moveMsg,
+    int shiftAmount
+) noexcept {
+    if (!moveMsg || !buffer || !localPlayer)
+        return false;
 
-    // КРИТИЧНО: обновляем ticksAllowedForProcessing
-    const int maxShift = (std::min)(move_msg->newCommands + Tickbase::ticksAllowedForProcessing, 16);
-    int newAllowed = maxShift - move_msg->newCommands - shiftAmount;
-    Tickbase::ticksAllowedForProcessing = (std::max)(0, newAllowed);
+    // Update ticks allowed
+    updateTicksAllowed(moveMsg, shiftAmount);
 
-    // Обновляем команды
-    const int oldNewCmds = move_msg->newCommands;
-    move_msg->newCommands = std::clamp(move_msg->newCommands + shiftAmount, 1, 62);
-    move_msg->backupCommands = 0;
+    // Save old command count
+    const int oldNewCmds = moveMsg->newCommands;
 
+    // Update move message
+    moveMsg->newCommands = std::clamp(moveMsg->newCommands + shiftAmount, 1, MAX_NEW_COMMANDS);
+    moveMsg->backupCommands = 0;
+
+    // Get next command number
     const int nextCmdNumber = memory->clientState->lastOutgoingCommand +
         memory->clientState->chokedCommands + 1;
 
-    // Пишем original commands
-    for (to = nextCmdNumber - oldNewCmds + 1; to <= nextCmdNumber; ++to)
-    {
+    // Write original commands
+    for (to = nextCmdNumber - oldNewCmds + 1; to <= nextCmdNumber; ++to) {
         if (!hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, true))
             return false;
         from = to;
     }
 
-    // Получаем последнюю команду
+    // Get last user command
     const auto userCmd = memory->input->getUserCmd(slot, from);
     if (!userCmd)
         return false;
 
-    // Клонируем команду N раз
-    auto fromCmd = *userCmd;
-    auto toCmd = *userCmd;
+    // Clone and write shifted commands
+    UserCmd fromCmd = *userCmd;
+    UserCmd toCmd = *userCmd;
 
-    for (int i = 0; i < shiftAmount; ++i)
-    {
+    for (int i = 0; i < shiftAmount; ++i) {
         ++toCmd.commandNumber;
-        toCmd.tickCount += 200; // Magic number для bypass
+        toCmd.tickCount += TICK_MAGIC_NUMBER;
 
         writeUsercmd(buffer, &toCmd, &fromCmd);
         fromCmd = toCmd;
@@ -1835,29 +1665,250 @@ static bool __fastcall writeUsercmdDeltaToBuffer(
     return true;
 }
 
+// ============================================
+// DEFENSIVE SHIFT (Break lag compensation)
+// ============================================
+
+static bool handleDefensiveShift(
+    int slot,
+    bufferWrite* buffer,
+    int& from,
+    int& to,
+    clMsgMove* moveMsg,
+    int shiftAmount
+) noexcept {
+    if (!moveMsg || !buffer || !localPlayer)
+        return false;
+
+    // Update ticks allowed
+    updateTicksAllowed(moveMsg, shiftAmount);
+
+    const int oldNewCmds = moveMsg->newCommands;
+
+    // Update move message
+    moveMsg->newCommands = std::clamp(moveMsg->newCommands + shiftAmount, 1, MAX_NEW_COMMANDS);
+    moveMsg->backupCommands = 0;
+
+    // Calculate adjusted tickbase
+    int firstTickbase = calculateAdjustedTickbase(oldNewCmds, moveMsg->newCommands, shiftAmount);
+
+    const int nextCmdNumber = memory->clientState->lastOutgoingCommand +
+        memory->clientState->chokedCommands + 1;
+
+    // Write original commands
+    for (to = nextCmdNumber - oldNewCmds + 1; to <= nextCmdNumber; ++to) {
+        if (!hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, true))
+            return false;
+        from = to;
+    }
+
+    // Update shift state for prediction
+    for (int i = memory->clientState->lastOutgoingCommand + 1; i <= nextCmdNumber; ++i) {
+        g_shiftState.shiftAmount = shiftAmount;
+        g_shiftState.overrideTickbase = true;
+        g_shiftState.adjustedTickbase = firstTickbase++;
+    }
+
+    // Get user command
+    const auto userCmd = memory->input->getUserCmd(slot, from);
+    if (!userCmd)
+        return false;
+
+    UserCmd fromCmd = *userCmd;
+    UserCmd toCmd = *userCmd;
+
+    ++toCmd.commandNumber;
+
+    // Reset prediction state
+    interfaces->prediction->previousStartFrame = -1;
+    interfaces->prediction->split->commandsPredicted = 0;
+
+    // Calculate target movement for defensive
+    Vector targetMove{};
+    if (config->tickbase.defensive_dt) {
+        const Vector& currentMove = g_shiftState.targetMove;
+
+        if (std::abs(currentMove.x) > 10.f)
+            targetMove.x = std::copysign(450.f, currentMove.x);
+
+        if (std::abs(currentMove.y) > 10.f)
+            targetMove.y = std::copysign(450.f, currentMove.y);
+    }
+
+    // Process doubletap shift
+    if (config->tickbase.doubletap.isActive()) {
+        // Increment choked packets
+        ++memory->clientState->chokedCommands;
+        ++memory->clientState->netChannel->chokedPackets;
+        ++memory->clientState->netChannel->outSequenceNr;
+
+        int processedTicks = 0;
+
+        do {
+            // Update prediction
+            interfaces->prediction->update(
+                memory->clientState->deltaTick,
+                memory->clientState->deltaTick > 0,
+                memory->clientState->lastCommandAck,
+                memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands
+            );
+
+            // Clear movement buttons (except essential ones)
+            toCmd.buttons &= ~BLOCKED_BUTTONS;
+            toCmd.sidemove = 0.f;
+            toCmd.forwardmove = 0.f;
+
+            // Apply movement on last ticks for defensive
+            if (localPlayer->isAlive()) {
+                if (!(toCmd.buttons & UserCmd::IN_JUMP) && (localPlayer->flags() & FL_ONGROUND)) {
+                    const int threshold = (std::max)(0, shiftAmount - 2);
+
+                    if (processedTicks >= threshold) {
+                        toCmd.forwardmove = targetMove.x;
+                        toCmd.sidemove = targetMove.y;
+                    }
+                }
+            }
+
+            // Store command
+            const int cmdIndex = toCmd.commandNumber % 150;
+            memory->input->commands[cmdIndex] = toCmd;
+            memory->input->verifiedCommands[cmdIndex] = { toCmd, toCmd.getChecksum() };
+
+            // Write to buffer
+            writeUsercmd(buffer, &toCmd, &fromCmd);
+
+            // Update tickbase override
+            g_shiftState.overrideTickbase = true;
+            g_shiftState.adjustedTickbase = firstTickbase++;
+
+            ++processedTicks;
+
+            // Update choked packets (except last tick)
+            if (processedTicks < shiftAmount) {
+                ++memory->clientState->chokedCommands;
+                ++memory->clientState->netChannel->chokedPackets;
+                ++memory->clientState->netChannel->outSequenceNr;
+            }
+
+            fromCmd = toCmd;
+            ++toCmd.commandNumber;
+
+        } while (processedTicks < shiftAmount);
+    }
+    else {
+        // Simple hideshots shift
+        toCmd.tickCount *= TICK_MAGIC_NUMBER;
+
+        int remaining = shiftAmount;
+        do {
+            writeUsercmd(buffer, &toCmd, &fromCmd);
+
+            fromCmd = toCmd;
+            ++toCmd.commandNumber;
+            --remaining;
+        } while (remaining > 0);
+    }
+
+    return true;
+}
+
+Vector m_move{};
+int m_adjusted_tick_base{}, m_shift_amount{};
+bool m_override_tick_base{}, m_restore_tick_base{};
+
+
+bool __fastcall writeUsercmdDeltaToBuffer(
+    void* ecx,
+    void* edx,
+    int slot,
+    bufferWrite* buffer,
+    int from,
+    int to,
+    bool isNewCmd
+) noexcept {
+    // Get current shift amount
+    const int shiftAmount = Tickbase::getCurrentShift();
+
+    // No shift needed - use original
+    if (shiftAmount <= 0) {
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, isNewCmd);
+    }
+
+    // Teleport mode - use original and let clMove handle it
+    if (config->tickbase.teleport) {
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, isNewCmd);
+    }
+
+    // Reset shift (we're handling it now)
+    Tickbase::resetShift();
+
+    // Validate
+    if (!localPlayer || !localPlayer->isAlive()) {
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, isNewCmd);
+    }
+
+    // Get move message
+    clMsgMove* moveMsg = getClMsgMove();
+    if (!moveMsg) {
+        return hooks->client.callOriginal<bool, 24>(slot, buffer, from, to, isNewCmd);
+    }
+
+    // Mark as processing
+    g_shiftState.isProcessing = true;
+
+    bool result;
+
+    // Choose shift method
+    if (config->tickbase.doubletap.isActive() && config->tickbase.defensive_dt) {
+        result = handleDefensiveShift(slot, buffer, from, to, moveMsg, shiftAmount);
+    }
+    else {
+        result = handleStandardShift(slot, buffer, from, to, moveMsg, shiftAmount);
+    }
+
+    g_shiftState.isProcessing = false;
+
+    return result;
+}
 
 static void __cdecl clMoveHook(float frameTime, bool isFinalTick) noexcept
 {
-    using clMoveFn = void(__cdecl*)(float, bool);
-    static auto original = (clMoveFn)hooks->clMove.getDetour();
+    // Get original function
+    using ClMoveFn = void(__cdecl*)(float, bool);
+    static auto original = reinterpret_cast<ClMoveFn>(hooks->clMove.getDetour());
 
-    if (!Tickbase::canRun())
+    if (!original)
         return;
 
+    // Check if tickbase can run (handles recharge)
+    if (!Tickbase::canRun()) {
+        return;
+    }
+
+    // Call original
     original(frameTime, isFinalTick);
 
-    if (!Tickbase::getTickshift() || !config->tickbase.teleport)
-        return;
+    // Check for teleport mode shift
+    const int shiftAmount = Tickbase::getCurrentShift();
 
+    if (shiftAmount <= 0 || !config->tickbase.teleport) {
+        return;
+    }
+
+    // Teleport mode: call clMove multiple times
     Tickbase::isShifting() = true;
 
-    for (int shiftAmount = 0; shiftAmount < Tickbase::getTickshift(); shiftAmount++)
-    {
-        Tickbase::isFinalTick() = (Tickbase::getTickshift() - shiftAmount) == 1;
-        original(frameTime, isFinalTick);
+    for (int i = 0; i < shiftAmount; ++i) {
+        // Mark final tick
+        Tickbase::isFinalTick() = (i == shiftAmount - 1);
+
+        // Call original again
+        original(frameTime, Tickbase::isFinalTick());
     }
+
     Tickbase::isShifting() = false;
-    Tickbase::resetTickshift();
+    Tickbase::resetShift();
 }
 
 static void __fastcall getColorModulationHook(void* thisPointer, void* edx, float* r, float* g, float* b) noexcept

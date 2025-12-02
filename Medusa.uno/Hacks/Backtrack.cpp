@@ -1,206 +1,415 @@
-// Backtrack.cpp - УЛУЧШЕННАЯ ВЕРСИЯ
-
-#include "../Config.h"
+#include "Backtrack.h"
 #include "AimbotFunctions.h"
 #include "Animations.h"
-#include "Backtrack.h"
 #include "Tickbase.h"
-#include "../xor.h"
+#include "../Config.h"
+#include "../Interfaces.h"
+#include "../Memory.h"
 #include "../SDK/ConVar.h"
 #include "../SDK/Entity.h"
-#include "../SDK/FrameStage.h"
 #include "../SDK/LocalPlayer.h"
 #include "../SDK/NetworkChannel.h"
 #include "../SDK/UserCmd.h"
+#include "../SDK/GlobalVars.h"
+#include "../SDK/Cvar.h"
+#include "../xor.h"
 #include <algorithm>
+#include <cmath>
+#include <unordered_map>
 
-static std::deque<Backtrack::incomingSequence> sequences;
+// ============================================
+// CACHED CONVARS
+// ============================================
 
-struct Cvars
-{
-    ConVar* updateRate;
-    ConVar* maxUpdateRate;
-    ConVar* interp;
-    ConVar* interpRatio;
-    ConVar* minInterpRatio;
-    ConVar* maxInterpRatio;
-    ConVar* maxUnlag;
-};
+namespace {
+    ConVar* cv_updateRate = nullptr;
+    ConVar* cv_maxUpdateRate = nullptr;
+    ConVar* cv_interp = nullptr;
+    ConVar* cv_interpRatio = nullptr;
+    ConVar* cv_minInterpRatio = nullptr;
+    ConVar* cv_maxInterpRatio = nullptr;
+    ConVar* cv_maxUnlag = nullptr;
 
-static Cvars cvars;
+    // Tracking data for priority calculation
+    std::unordered_map<int, Vector> lastOrigins{};
+    std::unordered_map<int, float> lastSimTimes{};
+}
 
-// НОВАЯ СТРУКТУРА: расширенные данные о backtrack записи
-struct BacktrackRecordInfo
-{
-    int playerIndex;
-    int recordIndex;
-    float simulationTime;
-    float priority;
-    Vector bestPosition;
-    bool isValid;
+// ============================================
+// INITIALIZATION
+// ============================================
 
-    bool operator<(const BacktrackRecordInfo& other) const noexcept
-    {
-        return priority > other.priority; // Descending
-    }
-};
+void Backtrack::init() noexcept {
+    cv_updateRate = interfaces->cvar->findVar("cl_updaterate");
+    cv_maxUpdateRate = interfaces->cvar->findVar("sv_maxupdaterate");
+    cv_interp = interfaces->cvar->findVar("cl_interp");
+    cv_interpRatio = interfaces->cvar->findVar("cl_interp_ratio");
+    cv_minInterpRatio = interfaces->cvar->findVar("sv_client_min_interp_ratio");
+    cv_maxInterpRatio = interfaces->cvar->findVar("sv_client_max_interp_ratio");
+    cv_maxUnlag = interfaces->cvar->findVar("sv_maxunlag");
 
-// УЛУЧШЕНИЕ: более точный расчет lerp с учетом всех факторов
-float Backtrack::getLerp() noexcept
-{
-    if (!cvars.interpRatio || !cvars.minInterpRatio || !cvars.maxInterpRatio ||
-        !cvars.interp || !cvars.updateRate)
-        return 0.0f;
+    updateConVars();
+}
+
+void Backtrack::reset() noexcept {
+    sequences.clear();
+    lastSequenceNumber = 0;
+    lastOrigins.clear();
+    lastSimTimes.clear();
+    conVars.initialized = false;
+}
+
+void Backtrack::updateConVars() noexcept {
+    if (cv_updateRate)
+        conVars.updateRate = cv_updateRate->getFloat();
+
+    if (cv_maxUpdateRate)
+        conVars.maxUpdateRate = cv_maxUpdateRate->getFloat();
+
+    if (cv_interp)
+        conVars.interp = cv_interp->getFloat();
+
+    if (cv_interpRatio)
+        conVars.interpRatio = cv_interpRatio->getFloat();
+
+    if (cv_minInterpRatio)
+        conVars.minInterpRatio = cv_minInterpRatio->getFloat();
+
+    if (cv_maxInterpRatio)
+        conVars.maxInterpRatio = cv_maxInterpRatio->getFloat();
+
+    if (cv_maxUnlag)
+        conVars.maxUnlag = cv_maxUnlag->getFloat();
+
+    conVars.initialized = true;
+}
+
+// ============================================
+// LERP CALCULATION
+// ============================================
+
+float Backtrack::getLerp() noexcept {
+    if (!conVars.initialized)
+        updateConVars();
 
     const float ratio = std::clamp(
-        cvars.interpRatio->getFloat(),
-        cvars.minInterpRatio->getFloat(),
-        cvars.maxInterpRatio->getFloat()
+        conVars.interpRatio,
+        conVars.minInterpRatio,
+        conVars.maxInterpRatio
     );
 
-    const float updateRate = cvars.maxUpdateRate ?
-        cvars.maxUpdateRate->getFloat() : cvars.updateRate->getFloat();
+    const float updateRate = conVars.maxUpdateRate > 0.f ?
+        conVars.maxUpdateRate : conVars.updateRate;
 
-    // Защита от деления на ноль
-    if (updateRate <= 0.0f)
-        return cvars.interp->getFloat();
+    if (updateRate <= 0.f)
+        return conVars.interp;
 
     const float calculatedLerp = ratio / updateRate;
 
-    return (std::max)(cvars.interp->getFloat(), calculatedLerp);
+    return (std::max)(conVars.interp, calculatedLerp);
 }
 
-// НОВАЯ ФУНКЦИЯ: расчет приоритета backtrack записи
-static float calculateRecordPriority(
-    const Animations::Players::Record& record,
-    Entity* entity,
-    const Vector& localEyePos,
-    const Vector& aimAngles) noexcept
-{
-    if (!entity)
-        return 0.0f;
+float Backtrack::getMaxUnlag() noexcept {
+    if (!conVars.initialized)
+        updateConVars();
 
-    float priority = 0.0f;
-
-    // Приоритет от времени (более свежие записи = лучше)
-    const float timeDelta = memory->globalVars->serverTime() - record.simulationTime;
-    const float maxUnlag = cvars.maxUnlag ? cvars.maxUnlag->getFloat() : 0.2f;
-    const float timeScore = 1.0f - (timeDelta / maxUnlag);
-    priority += timeScore * 50.0f;
-
-    // Приоритет от расстояния до позиций костей
-    float closestDistance = FLT_MAX;
-    for (const auto& pos : record.positions)
-    {
-        const float distance = (pos - localEyePos).length();
-        closestDistance = (std::min)(closestDistance, distance);
-    }
-
-    // Ближе = лучше (в пределах разумного)
-    if (closestDistance < 4096.0f)
-        priority += (1.0f - (closestDistance / 4096.0f)) * 30.0f;
-
-    // Приоритет от origin изменения (большее движение = лучше для backtrack)
-    static std::unordered_map<int, Vector> lastOrigins;
-    const int entityIndex = entity->index();
-
-    if (lastOrigins.find(entityIndex) != lastOrigins.end())
-    {
-        const float originDelta = (record.origin - lastOrigins[entityIndex]).length();
-        // Если игрок движется быстро - backtrack более эффективен
-        if (originDelta > 10.0f)
-            priority += (std::min)(originDelta * 0.5f, 20.0f);
-    }
-    lastOrigins[entityIndex] = record.origin;
-
-    // Приоритет от velocity (движущиеся цели = лучше для backtrack)
-    const float velocity = entity->velocity().length2D();
-    if (velocity > 50.0f)
-        priority += (std::min)(velocity * 0.1f, 15.0f);
-
-    return priority;
+    return conVars.maxUnlag > 0.f ? conVars.maxUnlag : MAX_UNLAG_DEFAULT;
 }
 
-// УЛУЧШЕННАЯ ФУНКЦИЯ: валидация backtrack записи
-bool Backtrack::valid(float simtime) noexcept
-{
-    if (!cvars.maxUnlag)
-        return false;
+// ============================================
+// VALIDATION
+// ============================================
 
+bool Backtrack::valid(float simulationTime) noexcept {
     const auto network = interfaces->engine->getNetworkChannel();
     if (!network)
         return false;
 
-    const float maxUnlag = cvars.maxUnlag->getFloat();
+    const float maxUnlag = getMaxUnlag();
     const float serverTime = memory->globalVars->serverTime();
 
-    // Проверка 1: не слишком старая запись
+    // Check 1: Not too old
     const float deadTime = serverTime - maxUnlag;
-    if (simtime < deadTime)
+    if (simulationTime < deadTime)
         return false;
 
-    // Проверка 2: не из будущего
-    if (simtime > serverTime)
+    // Check 2: Not in future
+    if (simulationTime > serverTime)
         return false;
 
-    // Проверка 3: учитываем latency и lerp
+    // Check 3: Account for latency and lerp
     const float latency = network->getLatency(0) + network->getLatency(1);
     const float lerp = getLerp();
 
-    // Учитываем tickbase shift если доступен
-    const float extraTickbaseDelta = Tickbase::canShiftDT(Tickbase::getTargetTickShift()) ?
-        ticksToTime(Tickbase::getTargetTickShift()) : 0.0f;
+    // Account for tickbase shift if available
+    float extraDelta = 0.f;
+    if (Tickbase::isReady()) {
+        extraDelta = ticksToTime(Tickbase::getTargetShift());
+    }
 
-    // Рассчитываем допустимое окно
-    const float totalDelay = std::clamp(latency + lerp, 0.0f, maxUnlag);
-    const float adjustedServerTime = serverTime - extraTickbaseDelta;
-    const float delta = totalDelay - (adjustedServerTime - simtime);
+    // Calculate valid window
+    const float totalDelay = std::clamp(latency + lerp, 0.f, maxUnlag);
+    const float adjustedServerTime = serverTime - extraDelta;
+    const float delta = totalDelay - (adjustedServerTime - simulationTime);
 
-    // Более строгая проверка для HvH
-    constexpr float tolerance = 0.2f; // 200ms tolerance
-    return std::abs(delta) <= tolerance;
+    // Tolerance check
+    return std::abs(delta) <= RECORD_TOLERANCE;
 }
 
-// НОВАЯ ФУНКЦИЯ: проверка качества backtrack записи
-static bool isRecordHighQuality(
-    const Animations::Players::Record& record,
-    Entity* entity,
-    const Animations::Players& player) noexcept
-{
-    if (!entity)
+bool Backtrack::isRecordValid(const Record& record, float serverTime) noexcept {
+    if (!record.isValid)
         return false;
 
-    // Проверка 1: запись не слишком старая
-    const float age = memory->globalVars->serverTime() - record.simulationTime;
-    if (age > 0.2f) // Старше 200ms = низкое качество
+    if (record.dormant)
         return false;
 
-    // Проверка 2: нет телепорта
-    if (!player.backtrackRecords.empty())
-    {
-        const auto& latestRecord = player.backtrackRecords.front();
-        const float distance = (record.origin - latestRecord.origin).length();
-        const float timeDelta = latestRecord.simulationTime - record.simulationTime;
+    return valid(record.simulationTime);
+}
 
-        if (timeDelta > 0.0f)
-        {
-            const float speed = distance / timeDelta;
-            // Если скорость > 1000 units/sec = вероятно телепорт
-            if (speed > 1000.0f)
-                return false;
+bool Backtrack::isRecordHighQuality(int playerIndex, const Record& record) noexcept {
+    // Check 1: Not too old
+    const float age = getRecordAge(record.simulationTime);
+    if (age > MAX_UNLAG_DEFAULT)
+        return false;
+
+    // Check 2: Valid origin
+    if (record.origin.null())
+        return false;
+
+    // Check 3: No teleport detection
+    auto it = lastOrigins.find(playerIndex);
+    if (it != lastOrigins.end()) {
+        const float distance = (record.origin - it->second).length();
+
+        auto timeIt = lastSimTimes.find(playerIndex);
+        if (timeIt != lastSimTimes.end()) {
+            const float timeDelta = record.simulationTime - timeIt->second;
+
+            if (timeDelta > 0.f) {
+                const float speed = distance / timeDelta;
+                // Speed > 1000 u/s = likely teleport
+                if (speed > 1000.f && distance > TELEPORT_THRESHOLD)
+                    return false;
+            }
         }
     }
 
-    // Проверка 3: валидная позиция
-    if (record.origin.x == 0.0f && record.origin.y == 0.0f && record.origin.z == 0.0f)
-        return false;
+    // Update tracking
+    lastOrigins[playerIndex] = record.origin;
+    lastSimTimes[playerIndex] = record.simulationTime;
 
     return true;
 }
 
-// УЛУЧШЕННАЯ ФУНКЦИЯ: основной backtrack
-void Backtrack::run(UserCmd* cmd) noexcept
-{
+// ============================================
+// PRIORITY CALCULATION
+// ============================================
+
+float Backtrack::calculatePriority(int playerIndex, const Record& record,
+    const Vector& eyePos, const Vector& aimAngles) noexcept {
+    float priority = 0.f;
+
+    // Time priority (fresher = better)
+    const float age = getRecordAge(record.simulationTime);
+    const float maxUnlag = getMaxUnlag();
+    const float timeScore = 1.f - std::clamp(age / maxUnlag, 0.f, 1.f);
+    priority += timeScore * 50.f;
+
+    // Distance priority
+    float closestDist = FLT_MAX;
+    for (const auto& pos : record.bonePositions) {
+        const float dist = (pos - eyePos).length();
+        closestDist = (std::min)(closestDist, dist);
+    }
+
+    if (closestDist < 4096.f) {
+        priority += (1.f - (closestDist / 4096.f)) * 30.f;
+    }
+
+    // Movement priority (moving targets benefit more from backtrack)
+    auto it = lastOrigins.find(playerIndex);
+    if (it != lastOrigins.end()) {
+        const float originDelta = (record.origin - it->second).length();
+        if (originDelta > 10.f) {
+            priority += (std::min)(originDelta * 0.5f, 20.f);
+        }
+    }
+
+    // Velocity priority
+    const float velocity = record.velocity.length2D();
+    if (velocity > 50.f) {
+        priority += (std::min)(velocity * 0.1f, 15.f);
+    }
+
+    return priority;
+}
+
+// ============================================
+// RECORD GATHERING
+// ============================================
+
+std::vector<Backtrack::RecordPriority> Backtrack::gatherValidRecords(UserCmd* cmd, float maxFov) noexcept {
+    std::vector<RecordPriority> validRecords;
+
+    if (!localPlayer || !localPlayer->isAlive())
+        return validRecords;
+
+    const auto weapon = localPlayer->getActiveWeapon();
+    if (!weapon)
+        return validRecords;
+
+    const Vector eyePos = localPlayer->getEyePosition();
+    const Vector aimPunch = weapon->requiresRecoilControl() ? localPlayer->getAimPunch() : Vector{};
+    const Vector aimAngles = cmd->viewangles - aimPunch;
+
+    for (int i = 1; i <= interfaces->engine->getMaxClients(); i++) {
+        const auto entity = interfaces->entityList->getEntity(i);
+        if (!entity || entity == localPlayer.get())
+            continue;
+
+        if (entity->isDormant() || !entity->isAlive())
+            continue;
+
+        if (!entity->isOtherEnemy(localPlayer.get()))
+            continue;
+
+        const auto& player = Animations::getPlayer(i);
+        if (!player.gotMatrix || player.backtrackRecords.empty())
+            continue;
+
+        for (size_t j = 0; j < player.backtrackRecords.size(); j++) {
+            const auto& btRecord = player.backtrackRecords[j];
+
+            // Validate
+            if (!valid(btRecord.simulationTime))
+                continue;
+
+            // Create Record from Animations::Players::Record
+            Record record;
+            record.simulationTime = btRecord.simulationTime;
+            record.origin = btRecord.origin;
+            record.absAngle = btRecord.absAngle;
+            record.mins = btRecord.mins;
+            record.maxs = btRecord.maxs;
+            record.isValid = true;
+
+            for (const auto& pos : btRecord.positions) {
+                record.bonePositions.push_back(pos);
+            }
+
+            // Quality check
+            if (!isRecordHighQuality(i, record))
+                continue;
+
+            // Find best bone position
+            float bestFov = FLT_MAX;
+            Vector bestPosition;
+
+            for (const auto& position : btRecord.positions) {
+                const auto angle = AimbotFunction::calculateRelativeAngle(
+                    eyePos, position, aimAngles
+                );
+
+                const float fov = std::hypot(angle.x, angle.y);
+
+                if (fov < bestFov) {
+                    bestFov = fov;
+                    bestPosition = position;
+                }
+            }
+
+            // FOV check
+            if (bestFov > maxFov)
+                continue;
+
+            // Calculate priority
+            float priority = calculatePriority(i, record, eyePos, aimAngles);
+            priority += (100.f - bestFov); // FOV bonus
+
+            // Add to list
+            RecordPriority rp;
+            rp.playerIndex = i;
+            rp.recordIndex = static_cast<int>(j);
+            rp.simulationTime = btRecord.simulationTime;
+            rp.priority = priority;
+            rp.fov = bestFov;
+            rp.bestPosition = bestPosition;
+            rp.visible = AimbotFunction::isVisible(entity, bestPosition);
+
+            // Visibility bonus
+            if (rp.visible) {
+                rp.priority += 25.f;
+            }
+
+            validRecords.push_back(rp);
+        }
+    }
+
+    // Sort by priority
+    std::sort(validRecords.begin(), validRecords.end());
+
+    return validRecords;
+}
+
+int Backtrack::findBestRecord(int playerIndex, const Vector& eyePos,
+    const Vector& aimAngles, float maxFov) noexcept {
+    const auto& player = Animations::getPlayer(playerIndex);
+
+    if (!player.gotMatrix || player.backtrackRecords.empty())
+        return -1;
+
+    int bestIndex = -1;
+    float bestPriority = -FLT_MAX;
+
+    for (size_t i = 0; i < player.backtrackRecords.size(); i++) {
+        const auto& btRecord = player.backtrackRecords[i];
+
+        if (!valid(btRecord.simulationTime))
+            continue;
+
+        // Create temp record for quality check
+        Record record;
+        record.simulationTime = btRecord.simulationTime;
+        record.origin = btRecord.origin;
+        record.isValid = true;
+
+        if (!isRecordHighQuality(playerIndex, record))
+            continue;
+
+        // Check FOV
+        float bestFov = FLT_MAX;
+        for (const auto& pos : btRecord.positions) {
+            const auto angle = AimbotFunction::calculateRelativeAngle(
+                eyePos, pos, aimAngles
+            );
+            bestFov = (std::min)(bestFov, std::hypot(angle.x, angle.y));
+        }
+
+        if (bestFov > maxFov)
+            continue;
+
+        // Calculate priority
+        for (const auto& pos : btRecord.positions) {
+            record.bonePositions.push_back(pos);
+        }
+
+        float priority = calculatePriority(playerIndex, record, eyePos, aimAngles);
+        priority += (100.f - bestFov);
+
+        if (priority > bestPriority) {
+            bestPriority = priority;
+            bestIndex = static_cast<int>(i);
+        }
+    }
+
+    return bestIndex;
+}
+
+// ============================================
+// MAIN BACKTRACK
+// ============================================
+
+void Backtrack::run(UserCmd* cmd) noexcept {
     if (!config->backtrack.enabled)
         return;
 
@@ -210,172 +419,123 @@ void Backtrack::run(UserCmd* cmd) noexcept
     if (!localPlayer || !localPlayer->isAlive())
         return;
 
-    const auto activeWeapon = localPlayer->getActiveWeapon();
-    if (!activeWeapon || activeWeapon->isKnife() || activeWeapon->isGrenade())
+    const auto weapon = localPlayer->getActiveWeapon();
+    if (!weapon || weapon->isKnife() || weapon->isGrenade())
         return;
 
-    const auto localPlayerEyePosition = localPlayer->getEyePosition();
-    const auto aimPunch = activeWeapon->requiresRecoilControl() ?
-        localPlayer->getAimPunch() : Vector{};
-
-    std::vector<BacktrackRecordInfo> validRecords;
-
-    // УЛУЧШЕНИЕ: собираем все валидные записи с приоритетами
-    for (int i = 1; i <= interfaces->engine->getMaxClients(); i++)
-    {
-        auto entity = interfaces->entityList->getEntity(i);
-        if (!entity || entity == localPlayer.get() || entity->isDormant() ||
-            !entity->isAlive() || !entity->isOtherEnemy(localPlayer.get()))
-            continue;
-
-        const auto player = Animations::getPlayer(i);
-        if (!player.gotMatrix || player.backtrackRecords.empty())
-            continue;
-
-        // Проверяем каждую запись
-        for (size_t j = 0; j < player.backtrackRecords.size(); j++)
-        {
-            const auto& record = player.backtrackRecords[j];
-
-            // Валидация записи
-            if (!Backtrack::valid(record.simulationTime))
-                continue;
-
-            // Проверка качества
-            if (!isRecordHighQuality(record, entity, player))
-                continue;
-
-            // Находим лучшую позицию кости в этой записи
-            float bestFov = FLT_MAX;
-            Vector bestPosition;
-
-            for (const auto& position : record.positions)
-            {
-                const auto angle = AimbotFunction::calculateRelativeAngle(
-                    localPlayerEyePosition,
-                    position,
-                    cmd->viewangles - aimPunch
-                );
-
-                const float fov = std::hypot(angle.x, angle.y);
-
-                if (fov < bestFov)
-                {
-                    bestFov = fov;
-                    bestPosition = position;
-                }
-            }
-
-            // Проверяем FOV лимит
-            if (bestFov > config->ragebot.fov)
-                continue;
-
-            // Рассчитываем приоритет
-            const float priority = calculateRecordPriority(
-                record,
-                entity,
-                localPlayerEyePosition,
-                cmd->viewangles - aimPunch
-            ) + (100.0f - bestFov); // Добавляем FOV бонус
-
-            // Добавляем запись
-            BacktrackRecordInfo info;
-            info.playerIndex = i;
-            info.recordIndex = static_cast<int>(j);
-            info.simulationTime = record.simulationTime;
-            info.priority = priority;
-            info.bestPosition = bestPosition;
-            info.isValid = true;
-
-            validRecords.push_back(info);
-        }
-    }
+    // Gather all valid records with priorities
+    auto validRecords = gatherValidRecords(cmd, config->ragebot.fov);
 
     if (validRecords.empty())
         return;
 
-    // Сортируем по приоритету
-    std::sort(validRecords.begin(), validRecords.end());
-
-    // Берем лучшую запись
+    // Get best record (already sorted by priority)
     const auto& bestRecord = validRecords.front();
 
-    // Устанавливаем tick count
-    cmd->tickCount = timeToTicks(bestRecord.simulationTime + getLerp());
+    // Set tick count
+    cmd->tickCount = getTickCount(bestRecord.simulationTime);
 }
 
-// УЛУЧШЕНИЕ: добавление latency с проверками
-void Backtrack::addLatencyToNetwork(NetworkChannel* network, float latency) noexcept
-{
+void Backtrack::update() noexcept {
+    // Update convars periodically
+    static float lastUpdate = 0.f;
+    const float currentTime = memory->globalVars->realtime;
+
+    if (currentTime - lastUpdate > 1.f) {
+        updateConVars();
+        lastUpdate = currentTime;
+    }
+
+    // Update sequences
+    updateIncomingSequences();
+}
+
+// ============================================
+// FAKE LATENCY
+// ============================================
+
+void Backtrack::addLatencyToNetwork(NetworkChannel* network, float latency) noexcept {
     if (!network || sequences.empty())
         return;
 
-    // Ограничиваем latency
-    latency = std::clamp(latency, 0.0f, 0.2f); // Максимум 200ms
+    // Clamp latency
+    latency = std::clamp(latency, 0.f, MAX_UNLAG_DEFAULT);
 
-    for (auto& sequence : sequences)
-    {
-        const float age = memory->globalVars->serverTime() - sequence.servertime;
+    const float serverTime = memory->globalVars->serverTime();
 
-        if (age >= latency)
-        {
-            network->inReliableState = sequence.inreliablestate;
-            network->inSequenceNr = sequence.sequencenr;
+    for (const auto& sequence : sequences) {
+        const float age = serverTime - sequence.serverTime;
+
+        if (age >= latency) {
+            network->inReliableState = sequence.inReliableState;
+            network->inSequenceNr = sequence.sequenceNr;
             break;
         }
     }
 }
 
-// УЛУЧШЕНИЕ: обновление sequence с защитой
-void Backtrack::updateIncomingSequences() noexcept
-{
-    static int lastIncomingSequenceNumber = 0;
-
+void Backtrack::updateIncomingSequences() noexcept {
     if (!localPlayer)
         return;
 
-    auto network = interfaces->engine->getNetworkChannel();
+    auto* network = interfaces->engine->getNetworkChannel();
     if (!network)
         return;
 
-    // Проверяем что sequence изменился
-    if (network->inSequenceNr != lastIncomingSequenceNumber)
-    {
-        lastIncomingSequenceNumber = network->inSequenceNr;
+    // Check if sequence changed
+    if (network->inSequenceNr == lastSequenceNumber)
+        return;
 
-        incomingSequence sequence{};
-        sequence.inreliablestate = network->inReliableState;
-        sequence.sequencenr = network->inSequenceNr;
-        sequence.servertime = memory->globalVars->serverTime();
+    lastSequenceNumber = network->inSequenceNr;
 
-        sequences.push_front(sequence);
-    }
+    // Add new sequence
+    IncomingSequence sequence;
+    sequence.inReliableState = network->inReliableState;
+    sequence.sequenceNr = network->inSequenceNr;
+    sequence.serverTime = memory->globalVars->serverTime();
 
-    // УЛУЧШЕНИЕ: динамический размер буфера на основе tickrate
-    const int maxSequences = (std::max)(timeToTicks(1.0f), 64);
-    while (sequences.size() > static_cast<size_t>(maxSequences))
+    sequences.push_front(sequence);
+
+    // Limit buffer size
+    const int maxSequences = (std::max)(timeToTicks(1.f), 64);
+    while (sequences.size() > static_cast<size_t>(maxSequences)) {
         sequences.pop_back();
-}
-
-void Backtrack::init() noexcept
-{
-    cvars.updateRate = interfaces->cvar->findVar(skCrypt("cl_updaterate"));
-    cvars.maxUpdateRate = interfaces->cvar->findVar(skCrypt("sv_maxupdaterate"));
-    cvars.interp = interfaces->cvar->findVar(skCrypt("cl_interp"));
-    cvars.interpRatio = interfaces->cvar->findVar(skCrypt("cl_interp_ratio"));
-    cvars.minInterpRatio = interfaces->cvar->findVar(skCrypt("sv_client_min_interp_ratio"));
-    cvars.maxInterpRatio = interfaces->cvar->findVar(skCrypt("sv_client_max_interp_ratio"));
-    cvars.maxUnlag = interfaces->cvar->findVar(skCrypt("sv_maxunlag"));
-
-    // Проверяем что все cvars найдены
-    if (!cvars.updateRate || !cvars.interp || !cvars.interpRatio ||
-        !cvars.minInterpRatio || !cvars.maxInterpRatio || !cvars.maxUnlag)
-    {
-        // Log error или fallback значения
     }
 }
 
-float Backtrack::getMaxUnlag() noexcept
-{
-    return cvars.maxUnlag ? cvars.maxUnlag->getFloat() : 0.2f;
+// ============================================
+// UTILITY
+// ============================================
+
+float Backtrack::getRecordAge(float simulationTime) noexcept {
+    return memory->globalVars->serverTime() - simulationTime;
+}
+
+int Backtrack::getTickCount(float simulationTime) noexcept {
+    return timeToTicks(simulationTime + getLerp());
+}
+
+// ============================================
+// GETTERS
+// ============================================
+
+const std::deque<Backtrack::IncomingSequence>& Backtrack::getSequences() noexcept {
+    return sequences;
+}
+
+const Backtrack::ConVarCache& Backtrack::getConVars() noexcept {
+    if (!conVars.initialized)
+        updateConVars();
+    return conVars;
+}
+
+bool Backtrack::isEnabled() noexcept {
+    return config->backtrack.enabled;
+}
+
+float Backtrack::getFakeLatency() noexcept {
+    if (!config->backtrack.fakeLatency)
+        return 0.f;
+
+    return static_cast<float>(config->backtrack.fakeLatencyAmount) / 1000.f;
 }

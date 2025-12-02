@@ -38,11 +38,10 @@ static void renderSnaplines(const PlayerData& player, ColorToggle config) noexce
 }
 
 struct BoundingBox {
-    float x0, y0;
-    float x1, y1;
+    float x0, y0, x1, y1;
     Vector vertices[8];
 
-    BoundingBox(const BaseData& entity) noexcept
+    BoundingBox(const BaseData& entity) noexcept : valid(false)
     {
         const auto [width, height] = interfaces->surface->getScreenSize();
 
@@ -51,33 +50,43 @@ struct BoundingBox {
         x1 = -x0;
         y1 = -y0;
 
-        const auto& mins = entity.obbMins;
-        const auto& maxs = entity.obbMaxs;
+        const Vector& mins = entity.obbMins;
+        const Vector& maxs = entity.obbMaxs;
 
+        // Предвычислить все 8 точек bbox
+        static constexpr int cornerIndices[8][3] = {
+            {0, 0, 0}, {1, 0, 0}, {0, 1, 0}, {1, 1, 0},
+            {0, 0, 1}, {1, 0, 1}, {0, 1, 1}, {1, 1, 1}
+        };
+
+        // Трансформировать все точки за один проход
         for (int i = 0; i < 8; ++i) {
-            const Vector point{ i & 1 ? maxs.x : mins.x,
-                                i & 2 ? maxs.y : mins.y,
-                                i & 4 ? maxs.z : mins.z };
+            const Vector point{
+                cornerIndices[i][0] ? maxs.x : mins.x,
+                cornerIndices[i][1] ? maxs.y : mins.y,
+                cornerIndices[i][2] ? maxs.z : mins.z
+            };
 
             if (!worldToScreen(point.transform(entity.coordinateFrame), vertices[i])) {
-                valid = false;
-                return;
+                return; // valid остается false
             }
-            x0 = min(x0, vertices[i].x);
-            y0 = min(y0, vertices[i].y);
-            x1 = max(x1, vertices[i].x);
-            y1 = max(y1, vertices[i].y);
+
+            // Обновить границы
+            if (vertices[i].x < x0) x0 = vertices[i].x;
+            if (vertices[i].y < y0) y0 = vertices[i].y;
+            if (vertices[i].x > x1) x1 = vertices[i].x;
+            if (vertices[i].y > y1) y1 = vertices[i].y;
         }
+
         valid = true;
     }
 
-    operator bool() noexcept
-    {
-        return valid;
-    }
+    inline operator bool() const noexcept { return valid; }
+
 private:
     bool valid;
 };
+
 
 static void renderBox(const PlayerData& player, const BoundingBox& bbox, Config::NewESP::Player& config) noexcept
 {
@@ -626,32 +635,59 @@ static void renderProjectileESP(const ProjectileData& entity, const char* name, 
 
 void ESP::render() noexcept
 {
-    if (memory->input->isCameraInThirdPerson)
+    // Быстрая проверка - включен ли вообще ESP
+    const bool localEnabled = config->esp.local.enable &&
+        memory->input->isCameraInThirdPerson;
+    const bool enemyEnabled = config->esp.enemy.enable;
+    const bool alliesEnabled = config->esp.allies.enable;
+    const bool weaponsEnabled = config->esp.weapons.enable;
+    const bool projectilesEnabled = config->esp.projectiles.enable;
+
+    if (!localEnabled && !enemyEnabled && !alliesEnabled &&
+        !weaponsEnabled && !projectilesEnabled)
+        return;
+
+    // Local player ESP
+    if (localEnabled)
         localPlayerESP(config->esp.local);
-    for (const auto& projectiles : GameData::projectiles()) {
-        if (config->esp.projectiles.enable)
-        {
-            renderProjectileESP(projectiles, projectiles.name, projectiles.icons, config->esp.projectiles);
+
+    // Player ESP
+    if (enemyEnabled || alliesEnabled) {
+        const auto& players = GameData::players();
+
+        for (const auto& player : players) {
+            // Быстрые проверки первыми
+            if (!player.alive || !player.inViewFrustum)
+                continue;
+
+            const float alpha = player.fadingAlpha();
+            if (alpha <= 0.0f)
+                continue;
+
+            auto& playerConfig = player.enemy ? config->esp.enemy : config->esp.allies;
+
+            if (!playerConfig.enable)
+                continue;
+
+            if (!playerConfig.dormant && player.dormant)
+                continue;
+
+            playerESP(player, playerConfig);
         }
     }
-    for (const auto& weapon : GameData::weapons()){
-        if (config->esp.weapons.enable)
-            weaponESP(weapon, config->esp.weapons);
+
+    // Projectiles ESP
+    if (projectilesEnabled) {
+        for (const auto& projectile : GameData::projectiles()) {
+            if (!projectile.exploded)
+                renderProjectileESP(projectile, projectile.name,
+                    projectile.icons, config->esp.projectiles);
+        }
     }
-    for (const auto& player : GameData::players()) {
-        if (!player.alive || !player.inViewFrustum)
-            continue;
 
-        auto& playerConfig = player.enemy ? config->esp.enemy : config->esp.allies;
-        if (!playerConfig.dormant && player.dormant)
-            continue;
-
-        if (!playerConfig.enable)
-            continue;
-
-        if (player.fadingAlpha() == 0)
-            continue;
-
-        playerESP(player, playerConfig);
+    // Weapons ESP
+    if (weaponsEnabled) {
+        for (const auto& weapon : GameData::weapons())
+            weaponESP(weapon, config->esp.weapons);
     }
 }

@@ -821,7 +821,20 @@ std::vector<Vector> multiPointDynamic(
     );
 }
 
-// AimbotFunctions.cpp - сксвьеммюъ бепяхъ hitChance
+bool AimbotFunction::isVisible(Entity* entity, const Vector& destination) noexcept {
+    if (!localPlayer)
+        return false;
+
+    Trace trace;
+    interfaces->engineTrace->traceRay(
+        { localPlayer->getEyePosition(), destination },
+        0x46004009, // MASK_SHOT without debris
+        localPlayer.get(),
+        trace
+    );
+
+    return trace.entity == entity || trace.fraction >= 0.97f;
+}
 
 bool AimbotFunction::hitChance(Entity* localPlayer, Entity* entity, StudioHitboxSet* set, const matrix3x4 matrix[MAXSTUDIOBONES], Entity* activeWeapon, const Vector& destination, const UserCmd* cmd, const int hitChance) noexcept
 {

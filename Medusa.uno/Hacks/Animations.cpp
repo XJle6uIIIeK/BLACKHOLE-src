@@ -7,6 +7,7 @@
 #include "../Interfaces.h"
 #include "../Helpers.h"
 #include "../SDK/LocalPlayer.h"
+#include "../SDK/NetworkChannel.h"
 #include "../SDK/Cvar.h"
 #include "../SDK/GlobalVars.h"
 #include "../SDK/ConVar.h"
@@ -536,7 +537,7 @@ void Animations::handlePlayers(FrameStage stage) noexcept {
     }
 
     float latency = 0.0f;
-    if (auto networkChannel = interfaces->engine->getNetworkChannel()) {
+    if (const auto networkChannel = interfaces->engine->getNetworkChannel()) {
         if (networkChannel->getLatency(0) > 0.0f && !config->backtrack.fakeLatency) {
             latency = networkChannel->getLatency(0);
         }

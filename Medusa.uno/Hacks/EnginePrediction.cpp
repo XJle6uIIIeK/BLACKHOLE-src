@@ -1,491 +1,524 @@
-// EnginePrediction.cpp - ИСПРАВЛЕННАЯ ВЕРСИЯ
-
+#include "EnginePrediction.h"
 #include "../Interfaces.h"
 #include "../Memory.h"
-#include "EnginePrediction.h"
 #include "../SDK/ClientState.h"
 #include "../SDK/Engine.h"
 #include "../SDK/Entity.h"
 #include "../SDK/EntityList.h"
-#include "../SDK/FrameStage.h"
 #include "../SDK/GameMovement.h"
 #include "../SDK/GlobalVars.h"
 #include "../SDK/MoveHelper.h"
 #include "../SDK/Prediction.h"
-#include "../SDK/PredictionCopy.h"
+#include "../SDK/LocalPlayer.h"
+#include "../SDK/Cvar.h"
+#include "../SDK/ConVar.h"
 #include "../xor.h"
+#include <algorithm>
+#include <cmath>
 
-// Backup структура для всех важных данных
-struct PredictionBackup
-{
-    // Player data
-    int flags;
-    Vector velocity;
-    Vector origin;
-    Vector aimPunch;
-    Vector aimPunchVel;
-    Vector viewPunch;
-    Vector viewOffset;
-    Vector baseVelocity;
-    float duckAmount;
-    float duckSpeed;
-    float fallVelocity;
-    float velocityModifier;
-    float thirdPersonRecoil;
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
 
-    // Weapon data (используем указатель на weapon)
-    Entity* weapon;
-    float nextPrimaryAttack;
-    float nextSecondaryAttack;
-    float recoilIndex;
-    int itemDefinitionIndex;
-
-    // Global vars
-    float currentTime;
-    float frameTime;
-    int tickCount;
-
-    // Animation state
-    float footYaw;
-    float duckAdditional;
-    float lastUpdateIncrement;
-};
-
-static PredictionBackup g_predictionBackup;
-static int localPlayerFlags;
-static Vector localPlayerVelocity;
-static bool inPrediction{ false };
-static std::array<EnginePrediction::NetvarData, 150> netvarData;
-static void* storedData = nullptr;
-EnginePrediction::NetvarData netvars{ };
-
-void EnginePrediction::reset() noexcept
-{
-    localPlayerFlags = {};
-    localPlayerVelocity = Vector{};
-    netvarData = {};
-    storedData = nullptr;
-    inPrediction = false;
-    g_predictionBackup = {};
-
-    m_data.fill(StoredData_t());
-}
-
-void EnginePrediction::update() noexcept
-{
-    if (!localPlayer || !localPlayer->isAlive())
-        return;
-
-    const auto deltaTick = memory->clientState->deltaTick;
-    const auto start = memory->clientState->lastCommandAck;
-    const auto stop = memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands;
-    bool valid{ memory->clientState->deltaTick > 0 };
-
-    if (netvars.velocityModifier < 1.f)
-        interfaces->prediction->inPrediction = true;
-
-    if (deltaTick > 0)
-    {
-        interfaces->prediction->update(deltaTick, valid, start, stop);
-    }
-}
-
-// Backup всех данных перед предикшеном
-static void backupData() noexcept
-{
-    if (!localPlayer || !localPlayer->isAlive())
-        return;
-
-    auto activeWeapon = localPlayer->getActiveWeapon();
-
-    // Player backup
-    g_predictionBackup.flags = localPlayer->flags();
-    g_predictionBackup.velocity = localPlayer->velocity();
-    g_predictionBackup.origin = localPlayer->origin();
-    g_predictionBackup.aimPunch = localPlayer->aimPunchAngle();
-    g_predictionBackup.aimPunchVel = localPlayer->aimPunchAngleVelocity();
-    g_predictionBackup.viewPunch = localPlayer->viewPunchAngle();
-    g_predictionBackup.viewOffset = localPlayer->viewOffset();
-    g_predictionBackup.baseVelocity = localPlayer->baseVelocity();
-    g_predictionBackup.duckAmount = localPlayer->duckAmount();
-    g_predictionBackup.duckSpeed = localPlayer->duckSpeed();
-    g_predictionBackup.fallVelocity = localPlayer->fallVelocity();
-    g_predictionBackup.velocityModifier = localPlayer->velocityModifier();
-    g_predictionBackup.thirdPersonRecoil = localPlayer->thirdPersonRecoil();
-
-    // Weapon backup
-    if (activeWeapon)
-    {
-        g_predictionBackup.weapon = activeWeapon;
-        g_predictionBackup.nextPrimaryAttack = activeWeapon->nextPrimaryAttack();
-        g_predictionBackup.nextSecondaryAttack = activeWeapon->nextSecondaryAttack();
-        g_predictionBackup.recoilIndex = activeWeapon->recoilIndex();
-        g_predictionBackup.itemDefinitionIndex = activeWeapon->itemDefinitionIndex();
-    }
-    else
-    {
-        g_predictionBackup.weapon = nullptr;
-    }
-
-    // Global vars backup
-    g_predictionBackup.currentTime = memory->globalVars->currenttime;
-    g_predictionBackup.frameTime = memory->globalVars->frametime;
-    g_predictionBackup.tickCount = memory->globalVars->tickCount;
-
-    // Animation state backup
-    if (localPlayer->getAnimstate())
-    {
-        g_predictionBackup.footYaw = localPlayer->getAnimstate()->footYaw;
-        g_predictionBackup.duckAdditional = localPlayer->getAnimstate()->duckAdditional;
-        g_predictionBackup.lastUpdateIncrement = localPlayer->getAnimstate()->lastUpdateIncrement;
-    }
-}
-
-// Restore данных после предикшена
-static void restoreData() noexcept
-{
-    if (!localPlayer || !localPlayer->isAlive())
-        return;
-
-    // Проверяем что weapon не изменился
-    if (g_predictionBackup.weapon && g_predictionBackup.weapon == localPlayer->getActiveWeapon())
-    {
-        auto activeWeapon = g_predictionBackup.weapon;
-
-        // Restore weapon data
-        activeWeapon->nextPrimaryAttack() = g_predictionBackup.nextPrimaryAttack;
-        activeWeapon->nextSecondaryAttack() = g_predictionBackup.nextSecondaryAttack;
-        activeWeapon->recoilIndex() = g_predictionBackup.recoilIndex;
-    }
-
-    // Restore global vars
-    memory->globalVars->currenttime = g_predictionBackup.currentTime;
-    memory->globalVars->frametime = g_predictionBackup.frameTime;
-    memory->globalVars->tickCount = g_predictionBackup.tickCount;
-}
-
-void EnginePrediction::run(UserCmd* cmd) noexcept
-{
-    if (!localPlayer || !localPlayer->isAlive())
-        return;
-
-    inPrediction = true;
-
-    // Backup всех данных
-    backupData();
-
-    float sv_footsteps_backup = 0.0f;
-    float sv_min_jump_landing_sound_backup = 0.0f;
+namespace {
+    // ConVar pointers (cached)
     ConVar* sv_footsteps = nullptr;
     ConVar* sv_min_jump_landing_sound = nullptr;
 
-    localPlayerFlags = localPlayer->flags();
-    localPlayerVelocity = localPlayer->velocity();
+    // Backup values for ConVars
+    float footstepsBackup = 0.f;
+    float jumpSoundBackup = 0.f;
 
+    void cacheConVars() noexcept {
+        if (!sv_footsteps)
+            sv_footsteps = interfaces->cvar->findVar("sv_footsteps");
+
+        if (!sv_min_jump_landing_sound)
+            sv_min_jump_landing_sound = interfaces->cvar->findVar("sv_min_jump_landing_sound");
+    }
+
+    void disableFootsteps() noexcept {
+        cacheConVars();
+
+        if (sv_footsteps) {
+            footstepsBackup = *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(sv_footsteps) + 0x2C);
+            *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(sv_footsteps) + 0x2C) = 0;
+        }
+
+        if (sv_min_jump_landing_sound) {
+            jumpSoundBackup = *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(sv_min_jump_landing_sound) + 0x2C);
+            *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(sv_min_jump_landing_sound) + 0x2C) = 0x7F7FFFFF;
+        }
+    }
+
+    void restoreFootsteps() noexcept {
+        if (sv_footsteps)
+            *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(sv_footsteps) + 0x2C) = footstepsBackup;
+
+        if (sv_min_jump_landing_sound)
+            *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(sv_min_jump_landing_sound) + 0x2C) = jumpSoundBackup;
+    }
+
+    void backupGlobalVars(EnginePrediction::PredictionBackup& backup) noexcept {
+        backup.currentTime = memory->globalVars->currenttime;
+        backup.frameTime = memory->globalVars->frametime;
+        backup.tickCount = memory->globalVars->tickCount;
+        backup.isFirstTimePredicted = interfaces->prediction->isFirstTimePredicted;
+        backup.inPrediction = interfaces->prediction->inPrediction;
+    }
+
+    void restoreGlobalVars(const EnginePrediction::PredictionBackup& backup) noexcept {
+        memory->globalVars->currenttime = backup.currentTime;
+        memory->globalVars->frametime = backup.frameTime;
+        memory->globalVars->tickCount = backup.tickCount;
+        interfaces->prediction->isFirstTimePredicted = backup.isFirstTimePredicted;
+        interfaces->prediction->inPrediction = backup.inPrediction;
+    }
+
+    void backupPlayerState(EnginePrediction::PredictionBackup& backup) noexcept {
+        if (!localPlayer || !localPlayer->isAlive())
+            return;
+
+        backup.flags = localPlayer->flags();
+        backup.velocity = localPlayer->velocity();
+        backup.origin = localPlayer->origin();
+        backup.viewOffset = localPlayer->viewOffset();
+        backup.aimPunch = localPlayer->aimPunchAngle();
+        backup.aimPunchVel = localPlayer->aimPunchAngleVelocity();
+        backup.viewPunch = localPlayer->viewPunchAngle();
+        backup.baseVelocity = localPlayer->baseVelocity();
+        backup.duckAmount = localPlayer->duckAmount();
+        backup.duckSpeed = localPlayer->duckSpeed();
+        backup.fallVelocity = localPlayer->fallVelocity();
+        backup.velocityModifier = localPlayer->velocityModifier();
+        backup.thirdPersonRecoil = localPlayer->thirdPersonRecoil();
+        backup.tickBase = localPlayer->tickBase();
+
+        // Animation state
+        if (auto* animState = localPlayer->getAnimstate()) {
+            backup.footYaw = animState->footYaw;
+            backup.duckAdditional = animState->duckAdditional;
+        }
+
+        // Weapon state
+        if (auto* weapon = localPlayer->getActiveWeapon()) {
+            backup.hasWeapon = true;
+            backup.nextPrimaryAttack = weapon->nextPrimaryAttack();
+            backup.nextSecondaryAttack = weapon->nextSecondaryAttack();
+            backup.recoilIndex = weapon->recoilIndex();
+            backup.accuracy = weapon->getInaccuracy();
+            backup.spread = weapon->getSpread();
+        }
+        else {
+            backup.hasWeapon = false;
+        }
+
+        backup.valid = true;
+    }
+
+    void restoreWeaponState(const EnginePrediction::PredictionBackup& backup) noexcept {
+        if (!localPlayer || !backup.valid || !backup.hasWeapon)
+            return;
+
+        auto* weapon = localPlayer->getActiveWeapon();
+        if (!weapon)
+            return;
+
+        // Only restore if weapon hasn't changed
+        weapon->nextPrimaryAttack() = backup.nextPrimaryAttack;
+        weapon->nextSecondaryAttack() = backup.nextSecondaryAttack;
+        weapon->recoilIndex() = backup.recoilIndex;
+    }
+}
+
+// ============================================
+// INITIALIZATION
+// ============================================
+
+void EnginePrediction::reset() noexcept {
+    for (auto& data : storedData) {
+        data = StoredData{};
+    }
+
+    currentNetvars = NetvarData{};
+    backup = PredictionBackup{};
+    lastCmd = nullptr;
+    savedFlags = 0;
+    savedVelocity = Vector{};
+    savedOrigin = Vector{};
+    inPrediction = false;
+}
+
+// ============================================
+// UPDATE
+// ============================================
+
+void EnginePrediction::update() noexcept {
+    if (!localPlayer || !localPlayer->isAlive())
+        return;
+
+    if (!memory->clientState)
+        return;
+
+    const int deltaTick = memory->clientState->deltaTick;
+    if (deltaTick <= 0)
+        return;
+
+    const int start = memory->clientState->lastCommandAck;
+    const int stop = memory->clientState->lastOutgoingCommand + memory->clientState->chokedCommands;
+
+    // Force prediction update if velocity modifier changed
+    if (currentNetvars.velocityModifier < 1.f)
+        interfaces->prediction->inPrediction = true;
+
+    interfaces->prediction->update(deltaTick, deltaTick > 0, start, stop);
+}
+
+// ============================================
+// MAIN PREDICTION
+// ============================================
+
+void EnginePrediction::run(UserCmd* cmd) noexcept {
+    if (!localPlayer || !localPlayer->isAlive())
+        return;
+
+    // Mark as in prediction
+    inPrediction = true;
+    lastCmd = cmd;
+
+    // Save pre-prediction state
+    savedFlags = localPlayer->flags();
+    savedVelocity = localPlayer->velocity();
+    savedOrigin = localPlayer->origin();
+
+    // Backup everything
+    backupGlobalVars(backup);
+    backupPlayerState(backup);
+
+    // Setup prediction random seed
     *memory->predictionRandomSeed = 0;
     *memory->predictionPlayer = reinterpret_cast<int>(localPlayer.get());
 
-    const auto oldCurrenttime = memory->globalVars->currenttime;
-    const auto oldFrametime = memory->globalVars->frametime;
-    const auto oldIsFirstTimePredicted = interfaces->prediction->isFirstTimePredicted;
-    const auto oldInPrediction = interfaces->prediction->inPrediction;
-
     // Setup prediction time
     memory->globalVars->currenttime = memory->globalVars->serverTime();
-    memory->globalVars->frametime = interfaces->prediction->enginePaused ? 0 : memory->globalVars->intervalPerTick;
+    memory->globalVars->frametime = interfaces->prediction->enginePaused ? 0.f : memory->globalVars->intervalPerTick;
     interfaces->prediction->isFirstTimePredicted = false;
     interfaces->prediction->inPrediction = true;
 
-    pLastCmd = cmd;
+    // Save tickbase for restoration
+    const int oldTickBase = localPlayer->tickBase();
 
-    const int iOldTickBase = localPlayer->tickBase();
+    // Update button states
+    const int currentButtons = cmd->buttons;
+    const int playerButtons = localPlayer->getButtons();
+    const int buttonsChanged = currentButtons ^ playerButtons;
 
-    // Update button state
-    const int iButtons = cmd->buttons;
-    const int nLocalButtons = localPlayer->getButtons();
-    const int nButtonsChanged = iButtons ^ nLocalButtons;
+    localPlayer->getButtonLast() = playerButtons;
+    localPlayer->getButtons() = currentButtons;
+    localPlayer->getButtonPressed() = buttonsChanged & currentButtons;
+    localPlayer->getButtonReleased() = buttonsChanged & (~currentButtons);
 
-    localPlayer->getButtonLast() = nLocalButtons;
-    localPlayer->getButtons() = iButtons;
-    localPlayer->getButtonPressed() = nButtonsChanged & iButtons;
-    localPlayer->getButtonReleased() = nButtonsChanged & (~iButtons);
-
-    // Run prethink
-    if (localPlayer->physicsRunThink(THINK_FIRE_ALL_FUNCTIONS))
+    // Run PreThink
+    if (localPlayer->physicsRunThink(0))
         localPlayer->preThink();
 
-    // Disable footsteps sounds
-    if (!sv_footsteps)
-        sv_footsteps = interfaces->cvar->findVar(skCrypt("sv_footsteps"));
+    // Disable footstep sounds during prediction
+    disableFootsteps();
 
-    if (!sv_min_jump_landing_sound)
-        sv_min_jump_landing_sound = interfaces->cvar->findVar(skCrypt("sv_min_jump_landing_sound"));
-
-    if (sv_footsteps)
-    {
-        sv_footsteps_backup = *(float*)(uintptr_t(sv_footsteps) + 0x2C);
-        *(uint32_t*)(uintptr_t(sv_footsteps) + 0x2C) = (uint32_t)sv_footsteps ^ uint32_t(0.0f);
-    }
-
-    if (sv_min_jump_landing_sound)
-    {
-        sv_min_jump_landing_sound_backup = *(float*)(uintptr_t(sv_min_jump_landing_sound) + 0x2C);
-        *(uint32_t*)(uintptr_t(sv_min_jump_landing_sound) + 0x2C) = (uint32_t)sv_min_jump_landing_sound ^ 0x7F7FFFFF;
-    }
-
-    // Handle impulse
+    // Handle impulse command
     if (cmd->impulse)
         *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(localPlayer.get()) + 0x320C) = cmd->impulse;
 
-    // Update buttons
+    // Update buttons from force states
     cmd->buttons |= *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(localPlayer.get()) + 0x3344);
     cmd->buttons &= ~(*reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(localPlayer.get()) + 0x3340));
 
     localPlayer->updateButtonState(cmd->buttons);
 
-    // Start prediction
+    // Start tracking prediction errors
     interfaces->gameMovement->startTrackPredictionErrors(localPlayer.get());
+
+    // Check for moving ground
     interfaces->prediction->checkMovingGround(localPlayer.get(), memory->globalVars->frametime);
 
+    // Run think functions
     localPlayer->runPreThink();
     localPlayer->runThink();
 
-    // Setup move
+    // Setup and process movement
     memory->moveHelper->setHost(localPlayer.get());
     interfaces->prediction->setupMove(localPlayer.get(), cmd, memory->moveHelper, memory->moveData);
-
-    // Process movement
     interfaces->gameMovement->processMovement(localPlayer.get(), memory->moveData);
-
-    // Finish move
     interfaces->prediction->finishMove(localPlayer.get(), cmd, memory->moveData);
+
+    // Process impacts
     memory->moveHelper->processImpacts();
 
+    // Run PostThink
     localPlayer->runPostThink();
 
-    // Restore footsteps
-    if (sv_footsteps)
-        *(float*)(uintptr_t(sv_footsteps) + 0x2C) = sv_footsteps_backup;
+    // Restore footstep sounds
+    restoreFootsteps();
 
-    if (sv_min_jump_landing_sound)
-        *(float*)(uintptr_t(sv_min_jump_landing_sound) + 0x2C) = sv_min_jump_landing_sound_backup;
-
-    // Finish tracking
+    // Finish tracking prediction errors
     interfaces->gameMovement->finishTrackPredictionErrors(localPlayer.get());
+
+    // Cleanup
     memory->moveHelper->setHost(nullptr);
     interfaces->gameMovement->reset();
 
+    // Reset prediction seeds
     *memory->predictionRandomSeed = -1;
     *memory->predictionPlayer = 0;
 
     // Restore global vars
-    memory->globalVars->currenttime = oldCurrenttime;
-    memory->globalVars->frametime = oldFrametime;
-    interfaces->prediction->isFirstTimePredicted = oldIsFirstTimePredicted;
-    interfaces->prediction->inPrediction = oldInPrediction;
+    restoreGlobalVars(backup);
 
     // Update weapon accuracy
-    const auto activeWeapon = localPlayer->getActiveWeapon();
-    if (activeWeapon && !activeWeapon->isGrenade() && !activeWeapon->isKnife())
-    {
-        // Restore tickbase
-        localPlayer->tickBase() = iOldTickBase;
-
-        // КРИТИЧЕСКИ ВАЖНО: обновляем accuracy penalty после предикшена
-        activeWeapon->updateAccuracyPenalty();
+    if (auto* weapon = localPlayer->getActiveWeapon()) {
+        if (!weapon->isGrenade() && !weapon->isKnife()) {
+            // Restore tickbase for accuracy calculation
+            localPlayer->tickBase() = oldTickBase;
+            weapon->updateAccuracyPenalty();
+        }
     }
 
-    // Restore weapon data
-    restoreData();
+    // Restore weapon timing data
+    restoreWeaponState(backup);
 
+    // Mark prediction as complete
     inPrediction = false;
 }
 
-void EnginePrediction::save() noexcept
-{
+// ============================================
+// STORE/RESTORE
+// ============================================
+
+void EnginePrediction::store() noexcept {
     if (!localPlayer || !localPlayer->isAlive())
         return;
-
-    if (!storedData)
-    {
-        const auto allocSize = localPlayer->getIntermidateDataSize();
-        storedData = new byte[allocSize];
-    }
-
-    if (!storedData)
-        return;
-
-    PredictionCopy helper(PC_EVERYTHING, (byte*)storedData, true, (byte*)localPlayer.get(), false, PredictionCopy::TRANSFERDATA_COPYONLY, NULL);
-    helper.transferData("EnginePrediction::save", localPlayer->index(), localPlayer->getPredDescMap());
-}
-
-void EnginePrediction::store() noexcept
-{
-    if (!localPlayer || !localPlayer->isAlive())
-        return;
-
-    // Fix view offset clamping
-    if (localPlayer->viewOffset().z <= 46.05f)
-        localPlayer->viewOffset().z = 46.0f;
-    else if (localPlayer->viewOffset().z > 64.0f)
-        localPlayer->viewOffset().z = 64.0f;
 
     const int tickbase = localPlayer->tickBase();
+    const int index = tickbase % MULTIPLAYER_BACKUP;
 
-    NetvarData netvars{ };
-    StoredData_t* data;
+    auto& data = storedData[index];
+    auto& netvars = data.netvars;
 
     netvars.tickbase = tickbase;
-    data = &m_data[tickbase % MULTIPLAYER_BACKUP];
+    netvars.valid = true;
 
-    // Store all netvar data
+    // Player state
+    netvars.flags = localPlayer->flags();
+    netvars.velocity = localPlayer->velocity();
+    netvars.origin = localPlayer->origin();
+    netvars.viewOffset = localPlayer->viewOffset();
+    netvars.networkOrigin = localPlayer->network_origin();
+    netvars.baseVelocity = localPlayer->baseVelocity();
+
+    // Punch angles
     netvars.aimPunchAngle = localPlayer->aimPunchAngle();
     netvars.aimPunchAngleVelocity = localPlayer->aimPunchAngleVelocity();
-    netvars.baseVelocity = localPlayer->baseVelocity();
+    netvars.viewPunchAngle = localPlayer->viewPunchAngle();
+
+    // Duck
     netvars.duckAmount = localPlayer->duckAmount();
     netvars.duckSpeed = localPlayer->duckSpeed();
-    netvars.fallVelocity = localPlayer->fallVelocity();
-    netvars.thirdPersonRecoil = localPlayer->thirdPersonRecoil();
-    netvars.velocity = localPlayer->velocity();
-    netvars.velocityModifier = localPlayer->velocityModifier();
-    netvars.viewPunchAngle = localPlayer->viewPunchAngle();
-    netvars.viewOffset = localPlayer->viewOffset();
-    netvars.network_origin = localPlayer->network_origin();
 
-    netvarData.at(tickbase % 150) = netvars;
+    // Misc
+    netvars.fallVelocity = localPlayer->fallVelocity();
+    netvars.velocityModifier = localPlayer->velocityModifier();
+    netvars.thirdPersonRecoil = localPlayer->thirdPersonRecoil();
+
+    // Weapon
+    if (auto* weapon = localPlayer->getActiveWeapon()) {
+        netvars.nextPrimaryAttack = weapon->nextPrimaryAttack();
+        netvars.nextSecondaryAttack = weapon->nextSecondaryAttack();
+        netvars.recoilIndex = weapon->recoilIndex();
+    }
+
+    // Clamp view offset
+    if (netvars.viewOffset.z <= 46.05f)
+        netvars.viewOffset.z = 46.0f;
+    else if (netvars.viewOffset.z > 64.0f)
+        netvars.viewOffset.z = 64.0f;
+
+    data.hasData = true;
+    currentNetvars = netvars;
 }
 
-void EnginePrediction::restore() noexcept
-{
+void EnginePrediction::restore() noexcept {
     if (!localPlayer || !localPlayer->isAlive())
         return;
 
     const int tickbase = localPlayer->tickBase();
-    netvars.tickbase = tickbase;
+    const int index = tickbase % MULTIPLAYER_BACKUP;
 
-    // Restore all netvars
+    const auto& data = storedData[index];
+
+    if (!data.hasData || data.netvars.tickbase != tickbase)
+        return;
+
+    const auto& netvars = data.netvars;
+
+    // Restore all values
     localPlayer->aimPunchAngle() = netvars.aimPunchAngle;
     localPlayer->aimPunchAngleVelocity() = netvars.aimPunchAngleVelocity;
+    localPlayer->viewPunchAngle() = netvars.viewPunchAngle;
+    localPlayer->velocity() = netvars.velocity;
     localPlayer->baseVelocity() = netvars.baseVelocity;
+    localPlayer->viewOffset() = netvars.viewOffset;
     localPlayer->duckAmount() = netvars.duckAmount;
     localPlayer->duckSpeed() = netvars.duckSpeed;
     localPlayer->fallVelocity() = netvars.fallVelocity;
-    localPlayer->thirdPersonRecoil() = netvars.thirdPersonRecoil;
-    localPlayer->velocity() = netvars.velocity;
     localPlayer->velocityModifier() = netvars.velocityModifier;
-    localPlayer->viewPunchAngle() = netvars.viewPunchAngle;
-    localPlayer->viewOffset() = netvars.viewOffset;
-    localPlayer->network_origin() = netvars.network_origin;
-
-    netvarData.at(tickbase % 150) = netvars;
+    localPlayer->thirdPersonRecoil() = netvars.thirdPersonRecoil;
 }
 
-void EnginePrediction::apply(FrameStage stage) noexcept
-{
+// ============================================
+// APPLY CORRECTIONS
+// ============================================
+
+void EnginePrediction::apply(FrameStage stage) noexcept {
     if (stage != FrameStage::NET_UPDATE_END)
         return;
 
     if (!localPlayer || !localPlayer->isAlive())
         return;
 
-    if (netvarData.empty())
-        return;
-
     const int tickbase = localPlayer->tickBase();
-    const auto& netvars = netvarData.at(tickbase % MULTIPLAYER_BACKUP);
+    const int index = tickbase % MULTIPLAYER_BACKUP;
 
-    if (!&netvars || netvars.tickbase != tickbase)
+    const auto& data = storedData[index];
+
+    if (!data.hasData || data.netvars.tickbase != tickbase)
         return;
 
-    // Calculate deltas
-    Vector punch_delta = localPlayer->aimPunchAngle() - netvars.aimPunchAngle;
-    Vector punch_vel_delta = localPlayer->aimPunchAngleVelocity() - netvars.aimPunchAngleVelocity;
-    Vector velocity_diff = localPlayer->m_vecVelocity() - netvars.m_vecVelocity;
-    Vector view_delta = localPlayer->viewOffset() - netvars.viewOffset;
-    float modifier_delta = localPlayer->velocityModifier() - netvars.velocityModifier;
-    Vector view_punch_angle_delta = localPlayer->viewPunchAngle() - netvars.viewPunchAngle;
-    Vector view_offset_delta = localPlayer->m_vecViewOffset() - netvars.m_vecViewOffset;
-    float thirdperson_recoil_delta = localPlayer->m_flThirdpersonRecoil() - netvars.m_flThirdpersonRecoil;
-    float duck_amount_delta = localPlayer->duckAmount() - netvars.duckAmount;
-    Vector viewoffset_diff = netvars.viewOffset - localPlayer->viewOffset();
+    const auto& netvars = data.netvars;
 
     // Apply corrections with tolerance checks
-    constexpr float tolerance = 0.03125f;
 
-    if (std::abs(punch_delta.x) <= tolerance && std::abs(punch_delta.y) <= tolerance && std::abs(punch_delta.z) <= tolerance)
+    // Aim punch
+    Vector punchDelta = localPlayer->aimPunchAngle() - netvars.aimPunchAngle;
+    if (std::abs(punchDelta.x) <= PREDICTION_TOLERANCE &&
+        std::abs(punchDelta.y) <= PREDICTION_TOLERANCE &&
+        std::abs(punchDelta.z) <= PREDICTION_TOLERANCE) {
         localPlayer->aimPunchAngle() = netvars.aimPunchAngle;
+    }
 
-    if (std::abs(punch_vel_delta.x) <= tolerance && std::abs(punch_vel_delta.y) <= tolerance && std::abs(punch_vel_delta.z) <= tolerance)
+    // Aim punch velocity
+    Vector punchVelDelta = localPlayer->aimPunchAngleVelocity() - netvars.aimPunchAngleVelocity;
+    if (std::abs(punchVelDelta.x) <= PREDICTION_TOLERANCE &&
+        std::abs(punchVelDelta.y) <= PREDICTION_TOLERANCE &&
+        std::abs(punchVelDelta.z) <= PREDICTION_TOLERANCE) {
         localPlayer->aimPunchAngleVelocity() = netvars.aimPunchAngleVelocity;
+    }
 
-    if (std::abs(viewoffset_diff.x) < tolerance && std::abs(viewoffset_diff.y) < tolerance && std::abs(viewoffset_diff.z) < tolerance)
-        localPlayer->viewOffset() = netvars.viewOffset;
-
-    if (std::abs(modifier_delta) <= tolerance)
-        localPlayer->velocityModifier() = netvars.velocityModifier;
-
-    if (std::fabs(view_punch_angle_delta.x) < tolerance && std::fabs(view_punch_angle_delta.y) < tolerance && std::fabs(view_punch_angle_delta.z) < tolerance)
+    // View punch
+    Vector viewPunchDelta = localPlayer->viewPunchAngle() - netvars.viewPunchAngle;
+    if (std::abs(viewPunchDelta.x) <= PREDICTION_TOLERANCE &&
+        std::abs(viewPunchDelta.y) <= PREDICTION_TOLERANCE &&
+        std::abs(viewPunchDelta.z) <= PREDICTION_TOLERANCE) {
         localPlayer->viewPunchAngle() = netvars.viewPunchAngle;
+    }
 
-    if (std::abs(velocity_diff.x) <= 0.5f && std::abs(velocity_diff.y) <= 0.5f && std::abs(velocity_diff.z) <= 0.5f)
-        localPlayer->m_vecVelocity() = netvars.m_vecVelocity;
+    // Velocity
+    Vector velDelta = localPlayer->velocity() - netvars.velocity;
+    if (std::abs(velDelta.x) <= VELOCITY_TOLERANCE &&
+        std::abs(velDelta.y) <= VELOCITY_TOLERANCE &&
+        std::abs(velDelta.z) <= VELOCITY_TOLERANCE) {
+        localPlayer->velocity() = netvars.velocity;
+    }
 
-    if (std::abs(duck_amount_delta) <= tolerance)
-        localPlayer->duckAmount() = netvars.duckAmount;
+    // View offset
+    Vector viewOffsetDelta = localPlayer->viewOffset() - netvars.viewOffset;
+    if (std::abs(viewOffsetDelta.x) <= PREDICTION_TOLERANCE &&
+        std::abs(viewOffsetDelta.y) <= PREDICTION_TOLERANCE &&
+        std::abs(viewOffsetDelta.z) <= PREDICTION_TOLERANCE) {
+        localPlayer->viewOffset() = netvars.viewOffset;
+    }
 
-    if (std::abs(localPlayer->duckSpeed() - netvars.duckSpeed) <= tolerance)
+    // Velocity modifier
+    if (std::abs(localPlayer->velocityModifier() - netvars.velocityModifier) <= PREDICTION_TOLERANCE) {
+        localPlayer->velocityModifier() = netvars.velocityModifier;
+    }
+
+    // Duck amount
+    if (std::abs(localPlayer->duckAmount() - netvars.duckAmount) <= PREDICTION_TOLERANCE) {
+        localPlayer->duckAmount() = std::clamp(netvars.duckAmount, 0.f, 1.f);
+    }
+
+    // Duck speed
+    if (std::abs(localPlayer->duckSpeed() - netvars.duckSpeed) <= PREDICTION_TOLERANCE) {
         localPlayer->duckSpeed() = netvars.duckSpeed;
+    }
 
-    if (std::abs(localPlayer->fallVelocity() - netvars.fallVelocity) <= 0.5f)
+    // Fall velocity
+    if (std::abs(localPlayer->fallVelocity() - netvars.fallVelocity) <= VELOCITY_TOLERANCE) {
         localPlayer->fallVelocity() = netvars.fallVelocity;
+    }
 
-    if (std::fabs(view_offset_delta.x) <= tolerance && std::fabs(view_offset_delta.y) <= tolerance && std::fabs(view_offset_delta.z) <= tolerance)
-        localPlayer->m_vecViewOffset() = netvars.m_vecViewOffset;
+    // Base velocity
+    Vector baseVelDelta = localPlayer->baseVelocity() - netvars.baseVelocity;
+    if (std::abs(baseVelDelta.x) <= PREDICTION_TOLERANCE &&
+        std::abs(baseVelDelta.y) <= PREDICTION_TOLERANCE &&
+        std::abs(baseVelDelta.z) <= PREDICTION_TOLERANCE) {
+        localPlayer->baseVelocity() = netvars.baseVelocity;
+    }
 
-    // Use checkDifference for additional safety
-    localPlayer->aimPunchAngle() = NetvarData::checkDifference(localPlayer->aimPunchAngle(), netvars.aimPunchAngle);
-    localPlayer->aimPunchAngleVelocity() = NetvarData::checkDifference(localPlayer->aimPunchAngleVelocity(), netvars.aimPunchAngleVelocity);
-    localPlayer->baseVelocity() = NetvarData::checkDifference(localPlayer->baseVelocity(), netvars.baseVelocity);
-    localPlayer->duckAmount() = std::clamp(NetvarData::checkDifference(localPlayer->duckAmount(), netvars.duckAmount), 0.0f, 1.0f);
-    localPlayer->duckSpeed() = NetvarData::checkDifference(localPlayer->duckSpeed(), netvars.duckSpeed);
-    localPlayer->fallVelocity() = NetvarData::checkDifference(localPlayer->fallVelocity(), netvars.fallVelocity);
-    localPlayer->thirdPersonRecoil() = NetvarData::checkDifference(localPlayer->thirdPersonRecoil(), netvars.thirdPersonRecoil);
-    localPlayer->velocity() = NetvarData::checkDifference(localPlayer->velocity(), netvars.velocity);
-    localPlayer->velocityModifier() = NetvarData::checkDifference(localPlayer->velocityModifier(), netvars.velocityModifier);
-    localPlayer->viewPunchAngle() = NetvarData::checkDifference(localPlayer->viewPunchAngle(), netvars.viewPunchAngle);
-    localPlayer->viewOffset() = NetvarData::checkDifference(localPlayer->viewOffset(), netvars.viewOffset);
-    localPlayer->tickBase() = static_cast<int>(NetvarData::checkDifference(static_cast<float>(localPlayer->tickBase()), static_cast<float>(netvars.tickbase)));
+    // Third person recoil
+    if (std::abs(localPlayer->thirdPersonRecoil() - netvars.thirdPersonRecoil) <= PREDICTION_TOLERANCE) {
+        localPlayer->thirdPersonRecoil() = netvars.thirdPersonRecoil;
+    }
 }
 
-int EnginePrediction::getFlags() noexcept
-{
-    return localPlayerFlags;
+// ============================================
+// PRE/POST FRAME HANDLERS
+// ============================================
+
+void EnginePrediction::onPreFrame() noexcept {
+    if (!localPlayer || !localPlayer->isAlive())
+        return;
+
+    // Store current state before frame
+    store();
 }
 
-Vector EnginePrediction::getVelocity() noexcept
-{
-    return localPlayerVelocity;
+void EnginePrediction::onPostFrame() noexcept {
+    if (!localPlayer || !localPlayer->isAlive())
+        return;
+
+    // Apply any needed corrections
+    // This is called after the game has processed the frame
 }
 
-bool EnginePrediction::isInPrediction() noexcept
-{
+// ============================================
+// GETTERS
+// ============================================
+
+int EnginePrediction::getFlags() noexcept {
+    return savedFlags;
+}
+
+Vector EnginePrediction::getVelocity() noexcept {
+    return savedVelocity;
+}
+
+Vector EnginePrediction::getOrigin() noexcept {
+    return savedOrigin;
+}
+
+bool EnginePrediction::isInPrediction() noexcept {
     return inPrediction;
 }
 
-static float checkDifference(float predicted, float original) noexcept
-{
-    float delta = predicted - original;
-    if (std::abs(delta) < 0.03125)
-        return original;
-    return predicted;
+float EnginePrediction::getServerTime() noexcept {
+    if (!localPlayer)
+        return 0.f;
+
+    return static_cast<float>(localPlayer->tickBase()) * memory->globalVars->intervalPerTick;
 }
 
-static Vector checkDifference(Vector predicted, Vector original) noexcept
-{
-    Vector delta = predicted - original;
-    if (std::abs(delta.x) < 0.03125 && std::abs(delta.y) < 0.03125f && std::abs(delta.z) < 0.031254)
-    {
-        return original;
-    }
-    return predicted;
+const EnginePrediction::NetvarData& EnginePrediction::getNetvarData(int tickbase) noexcept {
+    const int index = tickbase % MULTIPLAYER_BACKUP;
+    return storedData[index].netvars;
 }
